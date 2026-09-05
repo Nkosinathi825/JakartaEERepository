@@ -1,0 +1,220 @@
+Jakarta EE: A set of specifications maintained by the Eclipse Foundation for building enterprise-grade Java applications. It standardizes APIs for web tier, persistence, messaging, security, dependency injection, and other cross-cutting concerns, so applications can be written once and run on any compliant application server.
+
+------------------------------------------------------------------------------------------
+specification: A formal document together with a set of Java APIs that defines the behavior a compliant implementation must provide. The spec is the contract; the implementation is the code that honors it.
+
+implementation (a.k.a. provider): A concrete library that fulfills the contract defined by a specification. Different vendors ship different implementations of the same spec, and applications remain portable by coding against the spec's API, not the implementation's classes.
+
+	Jakarta Persistence----Hibernate, EclipseLink
+	Jakarta CDI (Contexts and Dependency Injection)--Weld
+	Jakarta REST----RESTEasy, Jersey
+	Jakarta Servlet	Undertow (in WildFly)----Tomcat's Catalina
+	Jakarta Security--Soteria
+------------------------------------------------------------------------------------------
+application server: A runtime environment that provides implementations of the Jakarta EE specifications and hosts deployed applications. It manages cross-cutting concerns such as transactions, security, connection pooling, threading, and component lifecycles, so applications can focus on business logic.
+
+The critical shift in thinking: your application is not a program. Your application is a library that the server loads. The server is the program. It started long before your code existed on disk, and it will keep running long after you undeploy.
+
+Examples: WildFly (Red Hat), Payara, Open Liberty (IBM), GlassFish (Eclipse). They compete on performance, tooling, footprint, and license, but they all implement the same specs.
+------------------------------------------------------------------------------------------
+Maven: A build and dependency management tool for Java projects that uses a declarative XML configuration (pom.xml) and a standardized project layout. It handles compilation, testing, packaging, and transitive dependency resolution through remote repositories.
+
+It solves three problems at once:
+
+	Standard project layout. Every Maven project puts source in src/main/java, resources in src/main/resources, tests in src/test/java. Once you know the convention, you can navigate any Maven project.
+
+	Declarative build. You describe what your project is in pom.xml (Project Object Model). Maven figures out how to compile, test, and package it.
+
+	Dependency management. You declare which libraries you need; Maven downloads them from a central repository (Maven Central) along with their transitive dependencies, and puts them on the classpath.
+
+Dependency scope. When you declare a dependency, you specify when it's needed. The scope compile (default) means it's needed at compile time and included in the packaged artifact. The scope provided means it's needed at compile time but not included in the artifact — because you expect the runtime environment to supply it. Jakarta EE API dependencies are always provided when deploying to an app server, because WildFly already has them.
+
+Packaging. A Maven project produces an artifact: a .jar, .war, or .ear. For web applications, we produce a WAR (Web Application Archive). It's just a ZIP file with a specific internal structure that the servlet container understands.
+
+Maven coordinates (GAV): The tuple of groupId, artifactId, and version that uniquely identifies a Maven artifact in a repository. Every dependency and every produced artifact is addressable by its GAV.
+
+	<groupId>, <artifactId>, <version>
+
+	These three together are called the Maven coordinates. They uniquely identify your artifact in any repository.
+
+	groupId — a reverse-DNS-style namespace (like Java packages). Use anything sensible for learning.
+	artifactId — the project's short name. Combined with the version, becomes the file name of the produced WAR.
+	version — the current version. 1.0-SNAPSHOT means "in-development toward 1.0." The -SNAPSHOT suffix has special meaning to Maven: SNAPSHOT versions can be republished repeatedly (used during development), while non-SNAPSHOT versions like 1.0 are immutable once released.
+
+Build the WAR
+
+	From the RegistrationAndLoginJakartaEE/ directory, run:
+
+	mvn clean package
+
+	Walk through what Maven does:
+
+	clean — deletes the target/ directory to start fresh.
+	validate — sanity-checks the pom.xml.
+	compile — compiles src/main/java/ into target/classes/.
+	test-compile / test — compiles and runs tests (none yet).
+	package — invokes maven-war-plugin, which:
+	Copies target/classes/ into WEB-INF/classes/ of the WAR.
+	Copies src/main/resources/ into WEB-INF/classes/.
+	Copies src/main/webapp/ into the root of the WAR.
+	Packages everything into a ZIP.
+	Writes it as target/user-app.war.
+
+	You should see output ending with BUILD SUCCESS. Inside target/ you'll find user-app.war. If you want to inspect it: it's just a ZIP — unzip -l target/user-app.war will list its contents.
+
+Here is the picture that ties everything above into one flow:
+
+You (developer)
+   │
+   │ writes code against Jakarta EE APIs (jakarta.* interfaces/annotations)
+   ▼
+Maven
+   │
+   │ downloads the API JARs (scope: provided) — for compilation only
+   │ packages your code into a .war
+   ▼
+.war artifact  ──deployed to──►  WildFly (already running as a JVM process)
+                                    │
+                                    │ scans your .war
+                                    │ wires your classes into its subsystems
+                                    │ provides the implementations of every spec
+                                    ▼
+                             Application is live, listening on port 8080
+
+Notice the asymmetry: at compile time you depend on the API. At runtime the implementation is provided by the server. That's why your artifact stays small and portable — you don't bundle Hibernate, Weld, RESTEasy, etc. They already live inside WildFly.
+
+------------------------------------------------------------------------------------------
+
+What Happens When Your Application Is Deployed
+
+When you drop my-app.war into standalone/deployments/ (or use the CLI or a Maven plugin):
+
+	The deployment scanner sees the file.
+
+	WildFly creates an isolated classloader for your application, so its classes and dependencies don't collide with other apps.
+
+	It reads the artifact's structure: WEB-INF/classes/, WEB-INF/lib/, WEB-INF/web.xml (if present), WEB-INF/beans.xml (if present).
+
+	Each subsystem does its own scan of your classes for annotations it cares about:
+
+		The web subsystem looks for @WebServlet, @WebFilter, etc.
+
+		The REST subsystem looks for @Path, @ApplicationPath.
+
+		The CDI subsystem looks for beans and injection points.
+
+		The JPA subsystem looks for persistence.xml and @Entity classes.
+
+	Bean metadata is built, injection graphs are resolved, servlet mappings are registered with Undertow, entity manager factories are constructed.
+
+	Any startup-scoped beans are instantiated.
+
+	WildFly logs Deployed "my-app.war" and starts routing HTTP requests to your endpoints.
+
+When you undeploy, the reverse happens: HTTP routes are unregistered, contexts are destroyed, @PreDestroy methods fire, connection pools associated with the app are released, and the classloader is discarded so the JVM can garbage-collect your classes.
+
+-------------------------------------------------------------------------------------------
+Why There Is No main()
+
+This is the conceptual pivot from Java SE to Jakarta EE. In a console app, you write main(). The JVM calls it. Your code drives the show — it decides when to read input, when to open files, when to exit.
+
+In Jakarta EE, the application server has the main(). It has been running since long before your app was deployed. Your code is a set of hooks — methods with annotations that tell the container: "call me when an HTTP request arrives for /users," "call me when the application starts," "call me when a transaction is about to commit."
+
+This is called Inversion of Control (IoC) — sometimes phrased as the "Hollywood principle": "Don't call us, we'll call you." You don't call the container; the container calls you.
+
+Inversion of Control: A design principle in which the flow of control of a program is transferred from the application code to an external framework or container. Instead of the application calling library code, the framework calls the application's code at defined extension points.
+
+This has enormous consequences you'll feel throughout the course:
+
+	You don't create objects with new for anything the container manages — the container creates and injects them.
+
+	You don't manage threads — the container assigns one thread per incoming request.
+
+	You don't open database connections — the container hands you one from a pool.
+
+	You don't begin/commit transactions manually — the container does it around your annotated method.
+
+-------------------------------------------------------------------------------------------
+
+<dependency>
+    <groupId>jakarta.platform</groupId>
+    <artifactId>jakarta.jakartaee-web-api</artifactId>
+    <version>10.0.0</version>
+    <scope>provided</scope>
+</dependency>
+
+This single dependency is a bill of materials that transitively pulls in every API JAR of the Web Profile: Servlet, REST, CDI, JPA, Validation, Security, JSON-P, JSON-B, WebSocket, etc. — the interfaces and annotations, not the implementations.
+
+------------------------------------------------------------------------------------------------
+
+The Directory Skeleton
+
+Under user-app/, create these directories (empty for now):
+
+RegistrationAndLoginJakartaEE/
+	├── pom.xml
+	└── src/
+	    └── main/
+	        ├── java/
+	        ├── resources/
+	        └── webapp/
+	            └── WEB-INF/
+
+A quick note on what belongs where:
+
+src/main/java/ — Java source. Compiled into WEB-INF/classes/ inside the WAR.
+src/main/resources/ — non-Java files that should end up on the classpath (e.g., persistence.xml later). Also flows into WEB-INF/classes/.
+src/main/webapp/ — web content. Anything here goes to the root of the WAR. HTML files, images, and the WEB-INF/ directory itself.
+src/main/webapp/WEB-INF/ — configuration and metadata. Not directly servable via HTTP — the servlet spec forbids it. This is where web.xml and beans.xml live.
+
+------------------------------------------------------------------------------------------------
+
+Step 4 — Writing Code That Runs at Startup
+
+Now the interesting part. We want some Java code of ours to execute when the app deploys, so we can print "Hello World" to the console log. But we have no main(). So how?
+
+The answer is a ServletContextListener — one of the oldest and most fundamental hooks in the entire Java EE / Jakarta EE world.
+
+The concept
+
+The Jakarta Servlet spec defines a small set of lifecycle event listeners. The container fires events at well-defined moments in an application's life, and if you register a listener, the container calls your listener's method when the event happens.
+
+The event we care about is the ServletContextEvent — specifically, contextInitialized, which fires after the container has finished setting up your application but before it starts routing HTTP requests to it. There's a matching contextDestroyed that fires when the application is being undeployed.
+
+ServletContext: An object provided by the servlet container that represents a running web application. There is exactly one ServletContext per deployed web app per JVM, and it provides access to application-wide configuration, resources, and attributes shared across all servlets in the app.
+
+ServletContextListener: A Jakarta Servlet lifecycle listener interface with two callback methods, contextInitialized and contextDestroyed, invoked by the container when a web application starts up and shuts down respectively. It is the standard mechanism for running code at application startup and teardown without a main method.
+
+implements ServletContextListener
+
+This is the contract. By implementing this interface, you're saying: "I have callback methods matching what the container expects to call at these lifecycle events."
+
+This is Inversion of Control at its most visible. You don't call contextInitialized(). You define it. The container calls it, at the exact moment it decides is correct.
+
+@WebListener
+
+This annotation is the registration mechanism. Its job is to say: "Container, please register this class as a listener for whatever listener interfaces it implements."
+
+Without any annotation, your class would compile fine, sit inside the WAR, and be completely ignored — because the container has no way of knowing it should treat this particular class specially. There are thousands of classes in a typical WAR; the container doesn't invoke every one that happens to implement an interface. Registration must be explicit.
+
+Who processes @WebListener, and when?
+
+When WildFly deploys your WAR, its web subsystem (Undertow) performs an annotation scan. It walks through every .class file in WEB-INF/classes/ and every JAR in WEB-INF/lib/, inspects the class-level annotations, and builds a registry of what it found. When it encounters @WebListener on a class, it:
+
+Instantiates the class (calling its no-arg constructor).
+Checks which listener interfaces the class implements — ServletContextListener, HttpSessionListener, ServletRequestListener, etc.
+Registers the instance with the appropriate internal listener lists.
+Later, when a matching event fires, the container walks its listener list and calls the appropriate method on each.
+
+What would happen if we removed @WebListener?
+
+The class would still be in the WAR. The container would still see the class exists. But it would never register it. contextInitialized would never be called. The application would deploy silently, with no "Hello World" in the log. Nothing would break — nothing would happen either. This is the crucial insight: in Jakarta EE, code without a registration mechanism is dead code from the container's perspective.
+
+The pre-annotation equivalent (which you'd see in ancient Java EE tutorials) was to declare the listener manually in WEB-INF/web.xml:
+
+xml
+<listener>
+    <listener-class>com.korah.learning.StartupListener</listener-class>
+</listener>
+
+Same effect. The annotation just moves the registration from XML into the class itself, which is generally more maintainable — the registration lives with the code it registers.
