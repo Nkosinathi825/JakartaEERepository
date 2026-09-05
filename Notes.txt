@@ -218,3 +218,32 @@ xml
 </listener>
 
 Same effect. The annotation just moves the registration from XML into the class itself, which is generally more maintainable — the registration lives with the code it registers.
+
+What just happened, second-by-second
+
+	Let me trace it, because this is the exact question the whole stage exists to answer:
+
+	1. Deployment scanner sees user-app.war in standalone/deployments/
+	2. WildFly acquires a lock on the deployment
+	3. WildFly creates a new isolated ClassLoader for this app
+	4. WildFly unpacks/opens the WAR, reads WEB-INF/classes/ and WEB-INF/lib/
+	5. The web subsystem (Undertow) scans classes for web annotations
+	6. It finds @WebListener on com.korah.learning.StartupListener
+	7. It sees StartupListener implements ServletContextListener
+	8. It instantiates StartupListener via its no-arg constructor
+	9. It registers the instance in the app's listener list
+	10. Once all component wiring is done, the container fires
+	    contextInitialized on every registered ServletContextListener
+	11. Your println runs — "Hello World from user-app!" hits the log
+	12. The container marks the app as ready and starts routing HTTP to it
+	    (though we have no endpoints, so nothing is actually served)
+
+How WildFly Detects the WAR
+
+	You may be wondering how the deployment scanner "sees" the file. It's not magic. WildFly runs a background thread that polls standalone/deployments/ at a configurable interval (5 seconds by default). When it sees a new .war, .jar, or .ear, it writes a marker file next to it (user-app.war.deployed on success, or user-app.war.failed if something went wrong). If you look in the deployments folder after a successful deploy, you'll see this marker — that's how WildFly knows next time it starts that the file was already processed.
+
+	This is the dev-friendly deployment method. In real production you'd deploy via the WildFly CLI or the Maven wildfly-maven-plugin (which talks to the server's management API), and the deployments folder wouldn't be used. But for learning, dropping files in a folder is the clearest way to feel the deploy/undeploy cycle.
+
+------------------------------------------------------------------------------------------------
+
+Jakarta Servlet: The foundational Jakarta EE specification for handling HTTP requests. A servlet is a Java class managed by a servlet container that responds to HTTP requests via lifecycle methods (init, service, destroy) and receives request and response objects representing the raw HTTP message.
