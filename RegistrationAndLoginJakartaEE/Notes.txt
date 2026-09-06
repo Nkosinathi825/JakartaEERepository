@@ -1,0 +1,1 @@
+Jakarta REST (JAX-RS): A Jakarta EE specification for building RESTful web services in Java. It provides annotations that map HTTP methods and URL paths to Java methods, and handles content negotiation, serialization, and response construction, so applications can focus on business logic rather than HTTP mechanics.

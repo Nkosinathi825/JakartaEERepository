@@ -17,8 +17,9 @@ public class HelloServlet extends HttpServlet {
     resp.setStatus(HttpServletResponse.SC_OK);
     resp.setContentType("text/plain");
     resp.setCharacterEncoding("UTF-8");
+    String name = req.getParameter("name");
 
-    resp.getWriter().write("Hello World ");
+    resp.getWriter().write((name != null ? "Hello " +"" +name : "Hello World "));
 
   }
 }
