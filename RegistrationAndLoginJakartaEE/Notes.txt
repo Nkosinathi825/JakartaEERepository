@@ -1,1 +1,383 @@
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta REST, CDI, and the Layered Architecture
+
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta REST
+-------------
+
+	The Spec Card
+	-------------
+
+		Specification: Jakarta RESTful Web Services 3.1 (still commonly called JAX-RS)
+
+		Purpose: Map HTTP requests to Java methods declaratively, and marshal Java return values into HTTP responses automatically.
+
+		API package: jakarta.ws.rs and subpackages
+
+		Implementation in WildFly: RESTEasy
+
+		What you write: plain Java classes annotated with @Path; methods annotated with @GET, @POST, etc.; optionally an Application subclass to declare the API's base path.
+
+		What WildFly does at runtime: at deployment, RESTEasy scans for JAX-RS classes, registers them with a single dispatcher servlet, and at request time it matches incoming HTTP requests against the annotations, invokes the matching method, and converts the return value into a proper HTTP response.
+
+		Interacts with: Servlet (REST is dispatched through a servlet), CDI (REST resources are CDI beans), Validation (JAX-RS honors validation annotations), JSON-B (automatic Java ↔ JSON conversion).
+
+
+	The Key Insight
+	---------------
+
+		REST doesn't replace Servlet — it's built on top of it. When you deploy a JAX-RS application, RESTEasy registers a single dispatcher servlet with Undertow. That servlet catches every request matching your API's base path and routes it internally to whichever @GET/@POST method matches.
+
+		This matters because everything you learned about servlets in Stage 2 — the thread-per-request model, the singleton-servlet caveat, the request lifecycle — is still happening underneath. REST is a convenience layer, not a different runtime.
+
+		Interview definition — Jakarta REST resource class: A plain Java class annotated with @Path whose methods are mapped to HTTP verbs via @GET, @POST, @PUT, @DELETE, and similar annotations. The container scans and registers such classes at deployment, then dispatches matching requests to their methods at runtime.
+
+    Enabling REST — the Application Class
+    -------------------------------------
+
+		Before we write the endpoint, we need to tell RESTEasy: "activate the JAX-RS machinery in this app, and here's the base path for all my endpoints." You do this with a tiny class extending jakarta.ws.rs.core.Application.
+
+			import jakarta.ws.rs.ApplicationPath;
+			import jakarta.ws.rs.core.Application;
+
+			@ApplicationPath("/api")
+			public class RestConfig extends Application {
+			}
+
+			That's the whole class. Three things to understand:
+
+				extends Application — this is the JAX-RS marker for "I am the entry point of a REST API." The Application base class has methods you can override to explicitly list your resource classes; if you leave it empty (as we have), RESTEasy will auto-discover any class annotated with @Path in your WAR. Auto-discovery is the modern default.
+
+				@ApplicationPath("/api") — the base path for every REST endpoint in this application. Combined with the context path (/user-app) and the resource's @Path, your full URLs will look like http://localhost:8080/user-app/api/hello. Choosing /api is convention: it visually separates HTTP API endpoints from any static resources or servlets served under other paths.
+
+				Who processes @ApplicationPath? RESTEasy, at deployment. When it sees this annotation on a subclass of Application, it registers its internal dispatcher servlet at that path (mapped as /api/*), so any request under /user-app/api/* gets routed into the JAX-RS runtime.
+
+				What would happen without this class? In some app servers, JAX-RS wouldn't activate at all. In WildFly, RESTEasy has fallback behavior that will still register at a default path, but relying on that is fragile and non-portable. Always create an Application subclass with @ApplicationPath. It's how you tell any spec-compliant server: "yes, I'm using JAX-RS; here's my base path."
+
+				The Annotation combined with the extend they make a maker and the annotation alone is a prefix for all the paths in this application
+
+
+
+		The REST Resource
+		-----------------
+
+			import jakarta.ws.rs.GET;
+			import jakarta.ws.rs.Path;
+			import jakarta.ws.rs.Produces;
+			import jakarta.ws.rs.core.MediaType;
+
+			@Path("/hello")
+			public class HelloResource {
+
+			    @GET
+			    @Produces(MediaType.TEXT_PLAIN)
+			    public String sayHello() {
+			        return "Hello World from REST";
+			    }
+			}
+
+			That's a functional HTTP endpoint. Compare it to the servlet from Stage 2 — same behavior, roughly a third of the code, no HttpServletRequest/HttpServletResponse in sight.
+
+			Let me dissect every annotation.
+			--------------------------------
+
+				@Path("/hello") on the class — declares that this class is a JAX-RS resource, and all its methods handle URLs starting with /hello. In JAX-RS, @Path at the class level is both a marker (this class is a resource) and a URL prefix. Without it, the class is invisible to RESTEasy.
+
+				@GET on the method — this method handles GET requests. There are matching @POST, @PUT, @DELETE, @PATCH, @HEAD, @OPTIONS annotations. The mapping is: HTTP verb → method annotation → Java method. Simple, declarative.
+
+				@Produces(MediaType.TEXT_PLAIN) — declares that this method produces text/plain responses. This is what sets your Content-Type header. RESTEasy uses it for two things:
+
+				Setting the response's Content-Type header automatically.
+				Content negotiation — if the client's Accept header requests something incompatible (e.g., Accept: application/pdf), RESTEasy will return HTTP 406 Not Acceptable without ever calling your method.
+
+				MediaType is a class with constants like TEXT_PLAIN, APPLICATION_JSON, APPLICATION_XML. You can also pass raw strings: @Produces("text/plain"). Use the constants — they catch typos at compile time.
+
+				Return type String — this is where JAX-RS earns its keep. You return a plain Java value, and RESTEasy converts it into a proper HTTP response body. For String returned as text/plain, the conversion is trivial (just encode as bytes). For a POJO returned as application/json, JAX-RS delegates to JSON-B (Jakarta JSON Binding) to serialize the object to JSON automatically. We'll see this in later stages.
+
+				The conversion machinery is called Message Body Writers. There's a registry of them — one for String, one for byte[], one for POJOs-as-JSON, one for Response, and so on. RESTEasy picks the right writer based on your return type and the @Produces media type. You can register custom writers for exotic types.
+
+				Content negotiation (JAX-RS): The mechanism by which the server chooses a response representation based on the client's Accept header and the resource method's @Produces annotations. If no method can satisfy the client's Accept, the container returns HTTP 406 Not Acceptable without invoking application code.
+
+			What Would Happen Without Each Annotation
+			-----------------------------------------
+
+				Understand these by imagining each removal:
+
+					Without @Path on the class: RESTEasy doesn't recognize the class as a resource. Endpoint doesn't exist. /hello returns 404.
+
+					Without @GET on the method: RESTEasy sees the resource class but has no verb mapping for the method. GET requests to /hello return 405 Method Not Allowed.\
+
+					Without @Produces: the response is sent, but with a Content-Type that RESTEasy guesses (typically application/octet-stream — "raw bytes"). Browsers may prompt to download instead of displaying. Content negotiation won't work properly.
+
+
+	The Request Lifecycle
+	---------------------
+
+		Browser
+		   │  HTTP GET /user-app/api/hello
+		   ▼
+		Undertow (Servlet container)
+		   │  routes to app "user-app", strips /user-app
+		   │  looks up servlet mappings — /api/* is mapped
+		   │  to RESTEasy's dispatcher servlet
+		   ▼
+		RESTEasy Dispatcher Servlet
+		   │  strips /api, has /hello remaining
+		   │  walks JAX-RS registry, finds HelloResource
+		   │  matches method: GET + /hello → sayHello()
+		   │  checks Accept header vs @Produces — compatible
+		   ▼
+		HelloResource.sayHello()          ← YOUR CODE (3 lines)
+		   │  returns "Hello World from REST"
+		   ▼
+		RESTEasy
+		   │  picks Message Body Writer for String + text/plain
+		   │  sets Content-Type: text/plain
+		   │  writes bytes to response
+		   ▼
+		Undertow
+		   │  flushes response
+		   ▼
+		Browser
+
+
+			Notice: you wrote three lines. RESTEasy is doing the same work Undertow normally does with Servlets — matching a URL, dispatching to a method, serializing a response — but at the JAX-RS level rather than the servlet level. From here on, REST is our default. We'll only fall back to raw servlets for things REST can't do cleanly (like the @WebListener for startup, which is inherently a servlet-container concept).
+
 Jakarta REST (JAX-RS): A Jakarta EE specification for building RESTful web services in Java. It provides annotations that map HTTP methods and URL paths to Java methods, and handles content negotiation, serialization, and response construction, so applications can focus on business logic rather than HTTP mechanics.
+
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta Context Dependancy Injection (The Central Spec)
+-------------------------------------------------------
+	
+	The Spec Card
+	-------------
+
+		Specification: Jakarta Contexts and Dependency Injection (CDI) 4.0
+
+		Purpose: A unified, type-safe, container-managed model for object creation, dependency injection, lifecycle, scoping, interception, and events.
+
+		API package: jakarta.enterprise.*, jakarta.inject.*
+
+		Implementation in WildFly: Weld
+
+		What you write: plain Java classes (often with a scope annotation), and @Inject on fields, constructors, or setters where a dependency should be resolved.
+
+		What WildFly does at runtime: at deployment, Weld scans your WAR for beans, builds a type-safe dependency graph, and at runtime creates and manages bean instances according to their declared scopes, injecting them wherever @Inject appears.
+
+		Interacts with: literally everything — REST resources are CDI beans, JPA-related components are CDI beans, security identity is CDI-injectable, transactions attach to CDI beans, etc.
+
+	Core Concepts
+	-------------
+
+		Bean — any class the container manages. In modern CDI, virtually every class in your app is potentially a bean; you only need to opt out with rare edge-case annotations.
+
+		Injection point — a place in your code where you want the container to supply a value. Marked with @Inject. Can be a field, a constructor parameter, or a setter parameter.
+
+		Scope — how long a bean instance lives and how it's shared. The container will create, cache, and destroy instances according to their scope. Common scopes:
+
+		@ApplicationScoped — one instance per application, shared by everyone. The Java-EE version of a singleton, but managed. Use for services with no per-request state.
+		@RequestScoped — one instance per HTTP request. Discarded when the request ends. Use for state that only makes sense within a single request.
+		@SessionScoped — one instance per HTTP session (per logged-in user). Use for per-user state that spans multiple requests. (Requires the bean to be Serializable.)
+		@Dependent — the default if no scope is declared. A new instance is created for each injection point; it lives as long as its owner.
+
+		CDI bean: A Java class managed by the CDI container, subject to lifecycle management, scoping, and dependency injection. Beans are discovered at deployment time and instantiated by the container when needed, according to their declared scope.
+
+		CDI scope: An annotation that defines the lifecycle and visibility of bean instances. The container maintains a context for each scope (application, session, request, conversation, dependent) and returns the appropriate instance based on the current context when a bean is injected.
+
+	How CDI Actually Works — the Runtime Model
+	------------------------------------------
+
+		Here is what happens in your WAR from deployment through first request, in detail:
+
+		At deployment time (once):
+		--------------------------
+
+			Weld scans your WAR looking for classes it can treat as beans. By default (in CDI 4.0's "annotated" bean-discovery mode), a class is a bean if it has an explicit CDI scope annotation. In older mode ("all"), every non-abstract class was a bean by default.
+
+			For each bean, Weld records: its type, its scope, its qualifiers (default is @Default), and its injection points (every field/constructor/setter marked @Inject).
+
+			Weld resolves the dependency graph: for every injection point, it identifies the bean(s) that could satisfy the type. If exactly one matches, wiring is unambiguous. If zero match: UnsatisfiedResolutionException at deploy time. If more than one matches: AmbiguousResolutionException at deploy time. (Both are deployment failures, not runtime errors — the container fails fast.)
+			For each scope, Weld sets up a context — a container-managed cache where instances of that scope live.
+
+		At runtime (per injection):
+		---------------------------
+
+			When code needs a bean (either because a request arrived at an @Inject-decorated field, or because you called beanManager.lookup(...) — rare), Weld:
+
+				Looks in the appropriate scope's context for an existing instance.
+				If none exists, instantiates the bean (calling the constructor, recursively resolving its injection points), then stores it in the context.
+				Returns the instance.
+
+		Proxies (a critical mechanism):
+		-------------------------------
+
+			For any bean that is not @Dependent, Weld doesn't actually give you the real bean instance at injection time. It gives you a proxy — a synthetic subclass of your bean, generated at deployment. The proxy holds no state itself; every method call on it delegates, at call time, to whichever instance is currently correct for the scope.
+
+			Why proxies? Consider: you inject an @RequestScoped bean into an @ApplicationScoped bean. The application bean lives forever; the request bean lives for one HTTP request. If Weld gave the application bean a direct reference to a specific request bean, that reference would be wrong on the second request. The proxy solves this — every time the application bean calls a method on its "injected" reference, the proxy resolves which request bean is current right now and forwards the call there.
+
+			This is invisible to you, and it's why you should never rely on bean instanceof MyExactClass or on reference identity (==) — you're comparing proxies, not real instances.
+
+			CDI proxy: A container-generated subclass of a bean, injected in place of the real instance for normal-scoped beans. The proxy delegates every method call to whichever real instance is currently active in the appropriate scope's context, allowing beans of longer scopes to safely hold references to beans of shorter scopes.
+
+		The beans.xml File
+		------------------
+
+			CDI historically required a marker file: WEB-INF/beans.xml. In modern CDI (4.0), it's optional but recommended for clarity — it lets you set the discovery mode explicitly.
+
+			Create src/main/webapp/WEB-INF/beans.xml:
+
+			xml
+			<?xml version="1.0" encoding="UTF-8"?>
+			<beans xmlns="https://jakarta.ee/xml/ns/jakartaee"
+			       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+			       xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee
+			                           https://jakarta.ee/xml/ns/jakartaee/beans_4_0.xsd"
+			       bean-discovery-mode="annotated"
+			       version="4.0">
+			</beans>
+
+			Two things worth understanding:
+
+				bean-discovery-mode="annotated" — Weld will treat as a bean only classes with an explicit CDI scope annotation (@Ap plicationScoped, @RequestScoped, etc.), or a select few others. This is the modern default and what we want.
+
+				The alternative, bean-discovery-mode="all", would treat every class in your WAR as an implicit @Dependent bean. This was the historical default. It's fallen out of favor because it makes bean discovery unpredictable and slows deployment.
+
+			Why we still create the file: even though CDI is auto-activated in a WAR, declaring beans.xml makes your discovery mode explicit and future-proof. It also serves as documentation — anyone opening the WAR knows immediately that CDI is in play.
+
+	Extract a Service and Inject It
+	-------------------------------
+
+		Create the Service
+		------------------
+
+			import jakarta.enterprise.context.ApplicationScoped;
+
+			@ApplicationScoped
+			public class HelloService {
+
+			    public String greet(String name) {
+			        if (name == null || name.isBlank()) {
+			            return "Hello, World";
+			        }
+			        return "Hello, " + name;
+			    }
+			}
+
+				@ApplicationScoped — one instance for the whole app. Perfectly appropriate for a stateless service. The container will lazily create the instance the first time it's needed, and it'll live until the app undeploys.
+
+				No @Inject yet — this service has no dependencies. It's a leaf.
+				Public no-arg constructor — implicit (Java provides it). CDI needs a no-arg constructor to create the bean, unless you provide a constructor annotated with @Inject. We'll see that pattern later.
+
+
+			@Path("/hello")
+			public class HelloResource {
+
+			    @Inject
+			    HelloService helloService;
+
+			    @GET
+			    @Produces(MediaType.TEXT_PLAIN)
+			    public String sayHello(@QueryParam("name") String name) {
+			        return helloService.greet(name);
+			    }
+			}
+
+
+				@Inject HelloService helloService; — the injection point. You are telling the container: "before you invoke any method on this resource, populate this field with a HelloService bean."
+
+				Note the field is package-private, not private. This is a convention (not a requirement — CDI can inject private fields via reflection). Package-private is preferred because it (a) makes the field visible to tests in the same package without needing reflection, and (b) subtly signals that this field is set by the container, not by application code.
+
+				Who processes @Inject? Weld, at bean-instantiation time.
+
+				When is HelloService actually created? On the first HTTP request to /hello. Sequence:
+
+				RESTEasy needs a HelloResource to handle the request.
+				Because HelloResource has @Path and JAX-RS integrates with CDI, RESTEasy asks Weld for a HelloResource bean.
+				Weld instantiates HelloResource (via its no-arg constructor).
+				Weld sees the @Inject HelloService field. It asks its own context: "any HelloService bean available?"
+				Weld finds HelloService in the bean registry (discovered at deploy time). It's @ApplicationScoped, and no instance exists yet. Weld instantiates it.
+				Weld stores the HelloService instance in the application context.
+				Weld sets the helloService field on the resource — but actually sets it to a proxy, not the raw instance.
+				RESTEasy invokes sayHello(name).
+				Your code calls helloService.greet(name) — the proxy resolves to the real instance and forwards the call.
+
+				On the second request, steps 4–6 are skipped for HelloService (already in the application context). A new HelloResource is created, though — because REST resource classes default to @RequestScoped-like behavior in JAX-RS (a new one per request unless you annotate otherwise).
+
+				@QueryParam("name") String name — a JAX-RS annotation for pulling a query parameter out of the URL. ?name=Korah → name will be "Korah". Missing → null. RESTEasy handles the extraction and (for other types) type conversion.
+
+				What Would Happen If You Removed @Inject?
+
+				The field would be null. Weld wouldn't try to populate it (no injection point declared). The first call to helloService.greet(name) would throw NullPointerException.
+
+				What Would Happen If You Removed @ApplicationScoped From HelloService?
+
+				Depends on your beans.xml mode. With bean-discovery-mode="annotated" (our setup), HelloService would not be discovered as a bean at all. Weld would report UnsatisfiedResolutionException at deploy time — the injection point in HelloResource cannot be resolved. The application would fail to deploy, and WildFly would log the failure prominently. This is CDI's fail-fast promise: wiring errors surface at deployment, not at request time.
+
+------------------------------------------------------------------------------------------------------------------
+
+The Layered Architecture
+-------------------------
+
+	Now that you can inject one class into another, we can start structuring the application properly. This is the shape we'll grow into over the coming stages:
+
+	       HTTP request
+	             │
+	             ▼
+	   ┌─────────────────────┐
+	   │  Resource layer     │   ← @Path, JAX-RS annotations
+	   │  (HelloResource)    │      Speaks HTTP. Nothing else.
+	   └─────────────────────┘
+	             │  injects
+	             ▼
+	   ┌─────────────────────┐
+	   │  Service layer      │   ← Business logic, orchestration
+	   │  (HelloService)     │      Speaks the *domain*. No HTTP, no SQL.
+	   └─────────────────────┘
+	             │  injects
+	             ▼
+	   ┌─────────────────────┐
+	   │  Repository layer   │   ← Persistence, data access
+	   │  (UserRepository)   │      Speaks SQL / JPA. No HTTP, no business rules.
+	   └─────────────────────┘
+	             │
+	             ▼
+	         Database
+
+	Why This Separation
+	-------------------
+
+		Each layer has one job, and dependencies flow in one direction (top-to-bottom, never the reverse). This is separation of concerns and dependency inversion applied together.
+
+		The Resource layer knows HTTP. It uses @Path, @GET, Response, @QueryParam. It translates HTTP into method calls on the service layer and translates the service's return values into HTTP responses. It does not contain business rules. If you moved to gRPC tomorrow, this layer would be rewritten; everything below it wouldn't change.
+
+		The Service layer knows the business. It coordinates operations, enforces rules ("passwords must be at least 8 characters"), calls repositories to load or save data, calls other services. It does not know HTTP exists. It does not know what database is used. It speaks in domain language: registerUser(email, password), not POST /users.
+
+		The Repository layer knows persistence. It uses JPA (EntityManager, JPQL queries). It exposes methods like findByEmail(String) or save(User). It does not contain business logic. If you migrated from PostgreSQL to MongoDB, this layer would be rewritten; the service layer wouldn't change (much).
+
+		The Rules
+
+			Resource depends on Service. Service does not depend on Resource.
+
+			Service depends on Repository. Repository does not depend on Service.
+
+			No layer skips layers. A resource should not talk to a repository directly. If it does, business logic will leak into resources over time — because the resource has to decide what to do with the raw data.
+
+			Data crosses layers as DTOs or entities. We'll formalize DTOs (Data Transfer Objects) in Stage 7. For now, primitives and simple types are fine.
+
+		Why "Dependencies Flow One Way" Matters
+		----------------------------------------
+
+			Because when a bug appears, you can localize it:
+
+				Wrong HTTP status? Resource layer.
+
+				Wrong business rule? Service layer.
+				
+				Wrong SQL? Repository layer.
+
+			And when you write tests, you can test each layer with the layers below it mocked out — which is the entire premise of Stage 12.
+
+			The temptation, especially early on, is to skip layers because "it's just a small app." Resist. Every enterprise codebase that became a nightmare started as a small app where someone put a database query in an HTTP handler because it was faster.

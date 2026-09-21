@@ -359,3 +359,151 @@ This is the heart of the stage. When you hit that URL, here's what actually happ
     renders "Hello World" as plain text
 
 Nineteen steps for two words on a page. The vast majority of them are the container doing work — parsing HTTP, routing, thread pool management, lifecycle, serialization. You wrote step 15. Everything else is what Jakarta EE gives you for free.
+
+------------------------------------------------------------------------------------------------
+
+Understanding Jakarta EE Specifications
+
+The Four Layers
+
+	Every piece of Jakarta EE fits into one of four layers. Keeping them separate in your head is the single biggest thing that distinguishes a confident Jakarta EE developer from a confused one.
+
+	   ┌──────────────────────────────────────────────┐
+	   │  4. RUNTIME / CONTAINER                      │
+	   │     (WildFly, Payara, Open Liberty, ...)     │
+	   │     Hosts implementations. Manages           │
+	   │     threads, classloaders, deployment.       │
+	   ├──────────────────────────────────────────────┤
+	   │  3. IMPLEMENTATION                           │
+	   │     (Hibernate, Weld, RESTEasy, Undertow)    │
+	   │     Actual working code that fulfills spec.  │
+	   ├──────────────────────────────────────────────┤
+	   │  2. API                                      │
+	   │     (jakarta.persistence.EntityManager,      │
+	   │      jakarta.ws.rs.GET, etc.)                │
+	   │     The Java interfaces and annotations.     │
+	   ├──────────────────────────────────────────────┤
+	   │  1. SPECIFICATION                            │
+	   │     (Jakarta Persistence 3.1, Jakarta REST   │
+	   │      3.1, ...) — the written document        │
+	   │     defining behavior, contracts, rules.     │
+	   └──────────────────────────────────────────────┘
+
+	   Layer 1 — Specification
+
+			A document published by the Eclipse Foundation. Human-readable prose that says, in exacting detail, what a compliant implementation must do. It has version numbers, chapters, and a formal review process. It describes:
+
+			1.What annotations exist and what they mean semantically.
+
+			2.What the API classes look like (their signatures).
+
+			3.What runtime behavior is required (e.g., "when persist() is called, the entity's state must be captured in the persistence context").
+
+			4.Edge cases, error conditions, thread-safety requirements, compatibility rules.
+
+			A specification does not contain executable code. It contains rules.
+
+			
+			Specification: A formal written document, together with a set of Java APIs (interfaces, annotations, abstract classes), that defines the required behavior of a compliant implementation. The specification is the contract; implementations are held to it via a Technology Compatibility Kit (TCK).
+
+		Layer 2 — API
+
+			The Java interfaces, annotations, and abstract classes that formalize the specification. These are the types you write your code against — @Entity, EntityManager, HttpServlet, @GET, @Inject.
+
+			The API JARs contain almost no implementation. They contain:
+
+			Interface declarations (no method bodies).
+			Annotation declarations.
+			A few abstract classes or exception types.
+			Rarely, small helper classes.
+
+			This is why the entire Jakarta EE 10 Web Profile API bundle is only a few megabytes — it's mostly signatures.
+
+			Your pom.xml from Stage 1 pulled in one such bundle:
+
+			xml
+			<groupId>jakarta.platform</groupId>
+			<artifactId>jakarta.jakartaee-web-api</artifactId>
+
+			That's the API. It knows nothing about how to actually persist an entity or handle an HTTP request.
+
+	   Layer 3 — Implementation (a.k.a. Provider)
+
+			The working code that fulfills the API's contracts. This is where the actual work happens: parsing SQL, opening sockets, reflecting on your classes, building proxies, managing transactions.
+
+			Each spec typically has multiple certified implementations. You choose one — or, if using an application server, one is chosen for you.
+
+			Some canonical pairings (memorize these; they come up constantly in tutorials, blog posts, and Stack Overflow answers):
+
+			Specification	Common Implementations
+			Jakarta Servlet	Undertow (WildFly), Apache Tomcat's Catalina
+			Jakarta REST	RESTEasy (WildFly), Jersey (GlassFish/Payara), Apache CXF
+			Jakarta CDI	Weld (WildFly, GlassFish, Payara), OpenWebBeans
+			Jakarta Persistence	Hibernate (WildFly), EclipseLink (GlassFish, Payara)
+			Jakarta Transactions	Narayana (WildFly), Atomikos, Bitronix
+			Jakarta Validation	Hibernate Validator (WildFly), Apache BVal
+			Jakarta Security	Soteria (WildFly, GlassFish, Payara)
+
+			Notice Hibernate appears as the JPA implementation. This is where a common misconception lives: people say "I know Hibernate," meaning they know its native API. But Hibernate is also a compliant implementation of the Jakarta Persistence spec. When you use @Entity and EntityManager, you're using JPA — Hibernate is fulfilling the contract under the hood. This distinction matters because JPA code is portable across implementations; Hibernate-native code is not.
+
+		Sharper mental model: spec = document, API = the Java types the document defines, implementation = the working code that honors the document.
+
+		Layer 4 — Runtime / Container
+
+			The application server: WildFly, in our case. Its job is to host implementations and provide the surrounding infrastructure — deployment, classloading, threading, HTTP listening, JMX management, clustering, transaction coordination across resources, and so on.
+
+			The container is what makes a bag of implementations into a running platform. Without it, you'd have to bootstrap Hibernate, Weld, RESTEasy, and Undertow yourself, wire them together, manage their lifecycles, and coordinate their interactions. Spring Boot does exactly this (with its own choices of implementations). Jakarta EE says: "Let the app server do it. You just deploy a WAR."
+
+			Application server / Jakarta EE container: A runtime that hosts implementations of the Jakarta EE specifications and provides shared infrastructure — component lifecycle management, thread pools, HTTP handling, transaction coordination, security, connection pooling. Applications deployed to it are configured and wired by the container rather than bootstrapping themselves.
+
+	The TCK — What Makes an Implementation "Certified"
+
+		Worth knowing for interviews and for reasoning about the ecosystem.
+
+		The Eclipse Foundation publishes a Technology Compatibility Kit (TCK) for each specification — a large test suite that a candidate implementation must pass to claim compliance. When you see a spec vendor say "certified Jakarta EE 10 implementation," they mean: "we ran the TCK and passed."
+
+		The TCK is why portability works at all. Every certified implementation, on every certified server, has passed the same tests. If you find a case where your code works on WildFly but breaks on Payara, the odds are (a) you're using a non-spec feature, (b) a configuration difference, or (c) genuinely a bug in one of the implementations — which is filable and fixable because the TCK defines the reference behavior.
+
+		Technology Compatibility Kit (TCK): A test suite maintained by the Eclipse Foundation for each Jakarta EE specification. Implementations must pass the TCK to claim certification for a given specification version. The TCK is what operationalizes the specification-implementation contract and enables portability.
+
+	The Portability Promise (and its asterisk)
+
+		The theoretical benefit of this four-layer separation is portability: your code depends only on the API (Layer 2), so you can deploy the same WAR to WildFly, Payara, or Open Liberty and it should behave identically because they all implement the same spec.
+
+		In practice, portability is real but imperfect:
+
+		Configuration is not portable. Datasources, security realms, and thread pools are configured differently on each server. standalone.xml is WildFly-only; Payara has its own admin console; Open Liberty uses server.xml.
+		Non-spec APIs leak in. If you use Hibernate-specific annotations (@org.hibernate.annotations.Type), you've bound yourself to Hibernate. Sometimes this is worth it for a capability the spec doesn't cover; often it's an accident.
+		Deployment tooling differs. Dropping a WAR into a folder works on WildFly and GlassFish; Open Liberty uses a different mechanism.
+
+		For our purposes: write to the spec whenever the spec is sufficient. Reach for implementation-specific features only when you know you need them and are consciously trading portability for capability. This is the same rule a senior engineer applies whether the ecosystem is Jakarta EE, Spring, .NET, or Node — depend on interfaces, escape only when you must.
+
+		What "Provided by WildFly" Actually Means
+
+		Now the concept from Stage 1 that we breezed past. When your pom.xml says:
+
+		xml
+		<scope>provided</scope>
+
+		... it means: "WildFly ships an implementation of this API. Don't bundle the API JARs into my WAR — WildFly will put them on the classpath at runtime."
+
+		But there's a deeper question: which implementation? You didn't choose Undertow. You didn't choose Hibernate. WildFly chose for you.
+
+		This is a feature, not a limitation. WildFly is a curated collection of well-tested implementations that are known to work together. The specific implementations are configured in standalone.xml under <subsystem> elements. If you open that file (just to peek — don't edit anything), you'll see sections like:
+
+		xml
+		<subsystem xmlns="urn:jboss:domain:undertow:...">
+		    ...
+		</subsystem>
+		<subsystem xmlns="urn:jboss:domain:jpa:...">
+		    <jpa default-datasource="" default-extended-persistence-inheritance="DEEP"/>
+		</subsystem>
+		<subsystem xmlns="urn:jboss:domain:weld:...">
+		    ...
+		</subsystem>
+
+		Each <subsystem> is WildFly's configuration of one implementation. The names are giveaways: undertow is the servlet impl, jpa is JPA (Hibernate underneath), weld is CDI.
+
+		You can replace the default implementation on WildFly (e.g., swap in EclipseLink instead of Hibernate for JPA) but doing so is rare, WildFly-specific, and outside the scope of what we're learning. Just know it's possible.
+
+		Interview definition — subsystem (WildFly): A modular component of the WildFly application server that provides a specific capability, such as HTTP handling, JPA, CDI, or security. Each subsystem wraps an implementation of one or more Jakarta EE specifications and is configured in standalone.xml. Subsystems can be disabled to trim server startup and memory footprint. 

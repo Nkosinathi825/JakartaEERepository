@@ -14,7 +14,6 @@ public class StartupListener implements ServletContextListener {
     System.out.println("  The application has started.");
     System.out.println("=====================================");
   }
-
   @Override
   public void contextDestroyed(ServletContextEvent sce) {
     System.out.println("=====================================");
