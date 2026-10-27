@@ -1,1 +1,1160 @@
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta REST, CDI, and the Layered Architecture
+
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta REST
+-------------
+
+	The Spec Card
+	-------------
+
+		Specification: Jakarta RESTful Web Services 3.1 (still commonly called JAX-RS)
+
+		Purpose: Map HTTP requests to Java methods declaratively, and marshal Java return values into HTTP responses automatically.
+
+		API package: jakarta.ws.rs and subpackages
+
+		Implementation in WildFly: RESTEasy
+
+		What you write: plain Java classes annotated with @Path; methods annotated with @GET, @POST, etc.; optionally an Application subclass to declare the API's base path.
+
+		What WildFly does at runtime: at deployment, RESTEasy scans for JAX-RS classes, registers them with a single dispatcher servlet, and at request time it matches incoming HTTP requests against the annotations, invokes the matching method, and converts the return value into a proper HTTP response.
+
+		Interacts with: Servlet (REST is dispatched through a servlet), CDI (REST resources are CDI beans), Validation (JAX-RS honors validation annotations), JSON-B (automatic Java ↔ JSON conversion).
+
+
+	The Key Insight
+	---------------
+
+		REST doesn't replace Servlet — it's built on top of it. When you deploy a JAX-RS application, RESTEasy registers a single dispatcher servlet with Undertow. That servlet catches every request matching your API's base path and routes it internally to whichever @GET/@POST method matches.
+
+		This matters because everything you learned about servlets in Stage 2 — the thread-per-request model, the singleton-servlet caveat, the request lifecycle — is still happening underneath. REST is a convenience layer, not a different runtime.
+
+		Interview definition — Jakarta REST resource class: A plain Java class annotated with @Path whose methods are mapped to HTTP verbs via @GET, @POST, @PUT, @DELETE, and similar annotations. The container scans and registers such classes at deployment, then dispatches matching requests to their methods at runtime.
+
+    Enabling REST — the Application Class
+    -------------------------------------
+
+		Before we write the endpoint, we need to tell RESTEasy: "activate the JAX-RS machinery in this app, and here's the base path for all my endpoints." You do this with a tiny class extending jakarta.ws.rs.core.Application.
+
+			import jakarta.ws.rs.ApplicationPath;
+			import jakarta.ws.rs.core.Application;
+
+			@ApplicationPath("/api")
+			public class RestConfig extends Application {
+			}
+
+			That's the whole class. Three things to understand:
+
+				extends Application — this is the JAX-RS marker for "I am the entry point of a REST API." The Application base class has methods you can override to explicitly list your resource classes; if you leave it empty (as we have), RESTEasy will auto-discover any class annotated with @Path in your WAR. Auto-discovery is the modern default.
+
+				@ApplicationPath("/api") — the base path for every REST endpoint in this application. Combined with the context path (/user-app) and the resource's @Path, your full URLs will look like http://localhost:8080/user-app/api/hello. Choosing /api is convention: it visually separates HTTP API endpoints from any static resources or servlets served under other paths.
+
+				Who processes @ApplicationPath? RESTEasy, at deployment. When it sees this annotation on a subclass of Application, it registers its internal dispatcher servlet at that path (mapped as /api/*), so any request under /user-app/api/* gets routed into the JAX-RS runtime.
+
+				What would happen without this class? In some app servers, JAX-RS wouldn't activate at all. In WildFly, RESTEasy has fallback behavior that will still register at a default path, but relying on that is fragile and non-portable. Always create an Application subclass with @ApplicationPath. It's how you tell any spec-compliant server: "yes, I'm using JAX-RS; here's my base path."
+
+				The Annotation combined with the extend they make a maker and the annotation alone is a prefix for all the paths in this application
+
+
+
+		The REST Resource
+		-----------------
+
+			import jakarta.ws.rs.GET;
+			import jakarta.ws.rs.Path;
+			import jakarta.ws.rs.Produces;
+			import jakarta.ws.rs.core.MediaType;
+
+			@Path("/hello")
+			public class HelloResource {
+
+			    @GET
+			    @Produces(MediaType.TEXT_PLAIN)
+			    public String sayHello() {
+			        return "Hello World from REST";
+			    }
+			}
+
+			That's a functional HTTP endpoint. Compare it to the servlet from Stage 2 — same behavior, roughly a third of the code, no HttpServletRequest/HttpServletResponse in sight.
+
+			Let me dissect every annotation.
+			--------------------------------
+
+				@Path("/hello") on the class — declares that this class is a JAX-RS resource, and all its methods handle URLs starting with /hello. In JAX-RS, @Path at the class level is both a marker (this class is a resource) and a URL prefix. Without it, the class is invisible to RESTEasy.
+
+				@GET on the method — this method handles GET requests. There are matching @POST, @PUT, @DELETE, @PATCH, @HEAD, @OPTIONS annotations. The mapping is: HTTP verb → method annotation → Java method. Simple, declarative.
+
+				@Produces(MediaType.TEXT_PLAIN) — declares that this method produces text/plain responses. This is what sets your Content-Type header. RESTEasy uses it for two things:
+
+				Setting the response's Content-Type header automatically.
+				Content negotiation — if the client's Accept header requests something incompatible (e.g., Accept: application/pdf), RESTEasy will return HTTP 406 Not Acceptable without ever calling your method.
+
+				MediaType is a class with constants like TEXT_PLAIN, APPLICATION_JSON, APPLICATION_XML. You can also pass raw strings: @Produces("text/plain"). Use the constants — they catch typos at compile time.
+
+				Return type String — this is where JAX-RS earns its keep. You return a plain Java value, and RESTEasy converts it into a proper HTTP response body. For String returned as text/plain, the conversion is trivial (just encode as bytes). For a POJO returned as application/json, JAX-RS delegates to JSON-B (Jakarta JSON Binding) to serialize the object to JSON automatically. We'll see this in later stages.
+
+				The conversion machinery is called Message Body Writers. There's a registry of them — one for String, one for byte[], one for POJOs-as-JSON, one for Response, and so on. RESTEasy picks the right writer based on your return type and the @Produces media type. You can register custom writers for exotic types.
+
+				Content negotiation (JAX-RS): The mechanism by which the server chooses a response representation based on the client's Accept header and the resource method's @Produces annotations. If no method can satisfy the client's Accept, the container returns HTTP 406 Not Acceptable without invoking application code.
+
+			What Would Happen Without Each Annotation
+			-----------------------------------------
+
+				Understand these by imagining each removal:
+
+					Without @Path on the class: RESTEasy doesn't recognize the class as a resource. Endpoint doesn't exist. /hello returns 404.
+
+					Without @GET on the method: RESTEasy sees the resource class but has no verb mapping for the method. GET requests to /hello return 405 Method Not Allowed.\
+
+					Without @Produces: the response is sent, but with a Content-Type that RESTEasy guesses (typically application/octet-stream — "raw bytes"). Browsers may prompt to download instead of displaying. Content negotiation won't work properly.
+
+
+	The Request Lifecycle
+	---------------------
+
+		Browser
+		   │  HTTP GET /user-app/api/hello
+		   ▼
+		Undertow (Servlet container)
+		   │  routes to app "user-app", strips /user-app
+		   │  looks up servlet mappings — /api/* is mapped
+		   │  to RESTEasy's dispatcher servlet
+		   ▼
+		RESTEasy Dispatcher Servlet
+		   │  strips /api, has /hello remaining
+		   │  walks JAX-RS registry, finds HelloResource
+		   │  matches method: GET + /hello → sayHello()
+		   │  checks Accept header vs @Produces — compatible
+		   ▼
+		HelloResource.sayHello()          ← YOUR CODE (3 lines)
+		   │  returns "Hello World from REST"
+		   ▼
+		RESTEasy
+		   │  picks Message Body Writer for String + text/plain
+		   │  sets Content-Type: text/plain
+		   │  writes bytes to response
+		   ▼
+		Undertow
+		   │  flushes response
+		   ▼
+		Browser
+
+
+			Notice: you wrote three lines. RESTEasy is doing the same work Undertow normally does with Servlets — matching a URL, dispatching to a method, serializing a response — but at the JAX-RS level rather than the servlet level. From here on, REST is our default. We'll only fall back to raw servlets for things REST can't do cleanly (like the @WebListener for startup, which is inherently a servlet-container concept).
+
 Jakarta REST (JAX-RS): A Jakarta EE specification for building RESTful web services in Java. It provides annotations that map HTTP methods and URL paths to Java methods, and handles content negotiation, serialization, and response construction, so applications can focus on business logic rather than HTTP mechanics.
+
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta Context Dependancy Injection (The Central Spec)
+-------------------------------------------------------
+	
+	The Spec Card
+	-------------
+
+		Specification: Jakarta Contexts and Dependency Injection (CDI) 4.0
+
+		Purpose: A unified, type-safe, container-managed model for object creation, dependency injection, lifecycle, scoping, interception, and events.
+
+		API package: jakarta.enterprise.*, jakarta.inject.*
+
+		Implementation in WildFly: Weld
+
+		What you write: plain Java classes (often with a scope annotation), and @Inject on fields, constructors, or setters where a dependency should be resolved.
+
+		What WildFly does at runtime: at deployment, Weld scans your WAR for beans, builds a type-safe dependency graph, and at runtime creates and manages bean instances according to their declared scopes, injecting them wherever @Inject appears.
+
+		Interacts with: literally everything — REST resources are CDI beans, JPA-related components are CDI beans, security identity is CDI-injectable, transactions attach to CDI beans, etc.
+
+	Core Concepts
+	-------------
+
+		Bean — any class the container manages. In modern CDI, virtually every class in your app is potentially a bean; you only need to opt out with rare edge-case annotations.
+
+		Injection point — a place in your code where you want the container to supply a value. Marked with @Inject. Can be a field, a constructor parameter, or a setter parameter.
+
+		Scope — how long a bean instance lives and how it's shared. The container will create, cache, and destroy instances according to their scope. Common scopes:
+
+		@ApplicationScoped — one instance per application, shared by everyone. The Java-EE version of a singleton, but managed. Use for services with no per-request state.
+		@RequestScoped — one instance per HTTP request. Discarded when the request ends. Use for state that only makes sense within a single request.
+		@SessionScoped — one instance per HTTP session (per logged-in user). Use for per-user state that spans multiple requests. (Requires the bean to be Serializable.)
+		@Dependent — the default if no scope is declared. A new instance is created for each injection point; it lives as long as its owner.
+
+		CDI bean: A Java class managed by the CDI container, subject to lifecycle management, scoping, and dependency injection. Beans are discovered at deployment time and instantiated by the container when needed, according to their declared scope.
+
+		CDI scope: An annotation that defines the lifecycle and visibility of bean instances. The container maintains a context for each scope (application, session, request, conversation, dependent) and returns the appropriate instance based on the current context when a bean is injected.
+
+	How CDI Actually Works — the Runtime Model
+	------------------------------------------
+
+		Here is what happens in your WAR from deployment through first request, in detail:
+
+		At deployment time (once):
+		--------------------------
+
+			Weld scans your WAR looking for classes it can treat as beans. By default (in CDI 4.0's "annotated" bean-discovery mode), a class is a bean if it has an explicit CDI scope annotation. In older mode ("all"), every non-abstract class was a bean by default.
+
+			For each bean, Weld records: its type, its scope, its qualifiers (default is @Default), and its injection points (every field/constructor/setter marked @Inject).
+
+			Weld resolves the dependency graph: for every injection point, it identifies the bean(s) that could satisfy the type. If exactly one matches, wiring is unambiguous. If zero match: UnsatisfiedResolutionException at deploy time. If more than one matches: AmbiguousResolutionException at deploy time. (Both are deployment failures, not runtime errors — the container fails fast.)
+			For each scope, Weld sets up a context — a container-managed cache where instances of that scope live.
+
+		At runtime (per injection):
+		---------------------------
+
+			When code needs a bean (either because a request arrived at an @Inject-decorated field, or because you called beanManager.lookup(...) — rare), Weld:
+
+				Looks in the appropriate scope's context for an existing instance.
+				If none exists, instantiates the bean (calling the constructor, recursively resolving its injection points), then stores it in the context.
+				Returns the instance.
+
+		Proxies (a critical mechanism):
+		-------------------------------
+
+			For any bean that is not @Dependent, Weld doesn't actually give you the real bean instance at injection time. It gives you a proxy — a synthetic subclass of your bean, generated at deployment. The proxy holds no state itself; every method call on it delegates, at call time, to whichever instance is currently correct for the scope.
+
+			Why proxies? Consider: you inject an @RequestScoped bean into an @ApplicationScoped bean. The application bean lives forever; the request bean lives for one HTTP request. If Weld gave the application bean a direct reference to a specific request bean, that reference would be wrong on the second request. The proxy solves this — every time the application bean calls a method on its "injected" reference, the proxy resolves which request bean is current right now and forwards the call there.
+
+			This is invisible to you, and it's why you should never rely on bean instanceof MyExactClass or on reference identity (==) — you're comparing proxies, not real instances.
+
+			CDI proxy: A container-generated subclass of a bean, injected in place of the real instance for normal-scoped beans. The proxy delegates every method call to whichever real instance is currently active in the appropriate scope's context, allowing beans of longer scopes to safely hold references to beans of shorter scopes.
+
+		The beans.xml File
+		------------------
+
+			CDI historically required a marker file: WEB-INF/beans.xml. In modern CDI (4.0), it's optional but recommended for clarity — it lets you set the discovery mode explicitly.
+
+			Create src/main/webapp/WEB-INF/beans.xml:
+
+			xml
+			<?xml version="1.0" encoding="UTF-8"?>
+			<beans xmlns="https://jakarta.ee/xml/ns/jakartaee"
+			       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+			       xsi:schemaLocation="https://jakarta.ee/xml/ns/jakartaee
+			                           https://jakarta.ee/xml/ns/jakartaee/beans_4_0.xsd"
+			       bean-discovery-mode="annotated"
+			       version="4.0">
+			</beans>
+
+			Two things worth understanding:
+
+				bean-discovery-mode="annotated" — Weld will treat as a bean only classes with an explicit CDI scope annotation (@Ap plicationScoped, @RequestScoped, etc.), or a select few others. This is the modern default and what we want.
+
+				The alternative, bean-discovery-mode="all", would treat every class in your WAR as an implicit @Dependent bean. This was the historical default. It's fallen out of favor because it makes bean discovery unpredictable and slows deployment.
+
+			Why we still create the file: even though CDI is auto-activated in a WAR, declaring beans.xml makes your discovery mode explicit and future-proof. It also serves as documentation — anyone opening the WAR knows immediately that CDI is in play.
+
+	Extract a Service and Inject It
+	-------------------------------
+
+		Create the Service
+		------------------
+
+			import jakarta.enterprise.context.ApplicationScoped;
+
+			@ApplicationScoped
+			public class HelloService {
+
+			    public String greet(String name) {
+			        if (name == null || name.isBlank()) {
+			            return "Hello, World";
+			        }
+			        return "Hello, " + name;
+			    }
+			}
+
+				@ApplicationScoped — one instance for the whole app. Perfectly appropriate for a stateless service. The container will lazily create the instance the first time it's needed, and it'll live until the app undeploys.
+
+				No @Inject yet — this service has no dependencies. It's a leaf.
+				Public no-arg constructor — implicit (Java provides it). CDI needs a no-arg constructor to create the bean, unless you provide a constructor annotated with @Inject. We'll see that pattern later.
+
+
+			@Path("/hello")
+			public class HelloResource {
+
+			    @Inject
+			    HelloService helloService;
+
+			    @GET
+			    @Produces(MediaType.TEXT_PLAIN)
+			    public String sayHello(@QueryParam("name") String name) {
+			        return helloService.greet(name);
+			    }
+			}
+
+
+				@Inject HelloService helloService; — the injection point. You are telling the container: "before you invoke any method on this resource, populate this field with a HelloService bean."
+
+				Note the field is package-private, not private. This is a convention (not a requirement — CDI can inject private fields via reflection). Package-private is preferred because it (a) makes the field visible to tests in the same package without needing reflection, and (b) subtly signals that this field is set by the container, not by application code.
+
+				Who processes @Inject? Weld, at bean-instantiation time.
+
+				When is HelloService actually created? On the first HTTP request to /hello. Sequence:
+
+				RESTEasy needs a HelloResource to handle the request.
+				Because HelloResource has @Path and JAX-RS integrates with CDI, RESTEasy asks Weld for a HelloResource bean.
+				Weld instantiates HelloResource (via its no-arg constructor).
+				Weld sees the @Inject HelloService field. It asks its own context: "any HelloService bean available?"
+				Weld finds HelloService in the bean registry (discovered at deploy time). It's @ApplicationScoped, and no instance exists yet. Weld instantiates it.
+				Weld stores the HelloService instance in the application context.
+				Weld sets the helloService field on the resource — but actually sets it to a proxy, not the raw instance.
+				RESTEasy invokes sayHello(name).
+				Your code calls helloService.greet(name) — the proxy resolves to the real instance and forwards the call.
+
+				On the second request, steps 4–6 are skipped for HelloService (already in the application context). A new HelloResource is created, though — because REST resource classes default to @RequestScoped-like behavior in JAX-RS (a new one per request unless you annotate otherwise).
+
+				@QueryParam("name") String name — a JAX-RS annotation for pulling a query parameter out of the URL. ?name=Korah → name will be "Korah". Missing → null. RESTEasy handles the extraction and (for other types) type conversion.
+
+				What Would Happen If You Removed @Inject?
+
+				The field would be null. Weld wouldn't try to populate it (no injection point declared). The first call to helloService.greet(name) would throw NullPointerException.
+
+				What Would Happen If You Removed @ApplicationScoped From HelloService?
+
+				Depends on your beans.xml mode. With bean-discovery-mode="annotated" (our setup), HelloService would not be discovered as a bean at all. Weld would report UnsatisfiedResolutionException at deploy time — the injection point in HelloResource cannot be resolved. The application would fail to deploy, and WildFly would log the failure prominently. This is CDI's fail-fast promise: wiring errors surface at deployment, not at request time.
+
+------------------------------------------------------------------------------------------------------------------
+
+The Layered Architecture
+-------------------------
+
+	Now that you can inject one class into another, we can start structuring the application properly. This is the shape we'll grow into over the coming stages:
+
+	       HTTP request
+	             │
+	             ▼
+	   ┌─────────────────────┐
+	   │  Resource layer     │   ← @Path, JAX-RS annotations
+	   │  (HelloResource)    │      Speaks HTTP. Nothing else.
+	   └─────────────────────┘
+	             │  injects
+	             ▼
+	   ┌─────────────────────┐
+	   │  Service layer      │   ← Business logic, orchestration
+	   │  (HelloService)     │      Speaks the *domain*. No HTTP, no SQL.
+	   └─────────────────────┘
+	             │  injects
+	             ▼
+	   ┌─────────────────────┐
+	   │  Repository layer   │   ← Persistence, data access
+	   │  (UserRepository)   │      Speaks SQL / JPA. No HTTP, no business rules.
+	   └─────────────────────┘
+	             │
+	             ▼
+	         Database
+
+	Why This Separation
+	-------------------
+
+		Each layer has one job, and dependencies flow in one direction (top-to-bottom, never the reverse). This is separation of concerns and dependency inversion applied together.
+
+		The Resource layer knows HTTP. It uses @Path, @GET, Response, @QueryParam. It translates HTTP into method calls on the service layer and translates the service's return values into HTTP responses. It does not contain business rules. If you moved to gRPC tomorrow, this layer would be rewritten; everything below it wouldn't change.
+
+		The Service layer knows the business. It coordinates operations, enforces rules ("passwords must be at least 8 characters"), calls repositories to load or save data, calls other services. It does not know HTTP exists. It does not know what database is used. It speaks in domain language: registerUser(email, password), not POST /users.
+
+		The Repository layer knows persistence. It uses JPA (EntityManager, JPQL queries). It exposes methods like findByEmail(String) or save(User). It does not contain business logic. If you migrated from PostgreSQL to MongoDB, this layer would be rewritten; the service layer wouldn't change (much).
+
+		The Rules
+
+			Resource depends on Service. Service does not depend on Resource.
+
+			Service depends on Repository. Repository does not depend on Service.
+
+			No layer skips layers. A resource should not talk to a repository directly. If it does, business logic will leak into resources over time — because the resource has to decide what to do with the raw data.
+
+			Data crosses layers as DTOs or entities. We'll formalize DTOs (Data Transfer Objects) in Stage 7. For now, primitives and simple types are fine.
+
+		Why "Dependencies Flow One Way" Matters
+		----------------------------------------
+
+			Because when a bug appears, you can localize it:
+
+				Wrong HTTP status? Resource layer.
+
+				Wrong business rule? Service layer.
+				
+				Wrong SQL? Repository layer.
+
+			And when you write tests, you can test each layer with the layers below it mocked out — which is the entire premise of Stage 12.
+
+			The temptation, especially early on, is to skip layers because "it's just a small app." Resist. Every enterprise codebase that became a nightmare started as a small app where someone put a database query in an HTTP handler because it was faster.
+
+------------------------------------------------------------------------------------------------------------------
+
+Persistence with Jakarta Persistence (JPA)
+------------------------------------------
+	
+	The Full Persistence Stack
+	--------------------------
+
+		Your Java object (User)
+		         │
+		         ▼
+		   Persistence Context          ← tracks managed entities (JPA concept)
+		         │
+		         ▼
+		   EntityManager                ← the JPA API you call
+		         │
+		         ▼
+		   JPA Provider (Hibernate)     ← translates JPA calls into SQL
+		         │
+		         ▼
+		   JDBC API (java.sql.*)        ← Java's standard SQL abstraction
+		         │
+		         ▼
+		   JDBC Driver (PostgreSQL)     ← speaks PostgreSQL wire protocol
+		         │
+		         ▼
+		   Database Connection          ← a TCP socket to the PostgreSQL process
+		         │
+		         ▼
+		   PostgreSQL                   ← the actual database server
+		         │
+		         ▼
+		   Disk / data files\
+
+	What a Database Connection Actually Is
+	---------------------------------------
+
+		Fundamentals first, because every misunderstanding about pooling, performance, and transactions starts here.
+
+		A database connection is a long-lived TCP socket between your JVM and the PostgreSQL server process, with authenticated state attached to it. When you "open a connection":
+
+		1.The TCP handshake happens (SYN, SYN-ACK, ACK).
+		
+		2.The PostgreSQL wire protocol handshake happens — your client sends a startup message with the database name and username.
+		
+		3.Authentication exchange — password, MD5 challenge, SCRAM, or whatever auth method is configured. Multiple round trips.
+		
+		4.The server allocates a backend process (PostgreSQL is one-process-per-connection — this is why PostgreSQL connections are expensive compared to e.g. MySQL threads).
+		
+		5.Session state is initialized: default transaction isolation, timezone, encoding, prepared-statement cache.
+
+
+		database connection: A stateful, authenticated TCP session between an application and a database server. Establishing one requires network round trips for TCP handshake, protocol negotiation, and authentication, and consumes server-side resources (memory, process slots). Because connection setup is expensive, applications typically reuse connections via a connection pool rather than creating one per operation.
+
+	JDBC(Java Database Connectivity)
+	--------------------------------
+
+		JDBC (Java Database Connectivity) is Java SE's standard low-level database API — the java.sql.* package. You've probably seen the shape:
+
+
+			Connection conn = DriverManager.getConnection(url, user, password);
+			PreparedStatement ps = conn.prepareStatement("INSERT INTO users (email) VALUES (?)");
+			ps.setString(1, "korah@example.com");
+			ps.executeUpdate();
+			ps.close();
+			conn.close();
+
+		Three things to understand about JDBC's role:
+
+			It's a spec, not an implementation. Connection, PreparedStatement, ResultSet are interfaces in java.sql. The actual implementations ship as JDBC drivers — a JAR per database vendor. PostgreSQL's driver is org.postgresql:postgresql; it implements all those interfaces and knows how to speak the PostgreSQL wire protocol over a socket.
+
+			It's low-level. You write SQL strings, bind parameters by index, iterate ResultSet rows, map columns to Java fields by hand, and manage resource closing (classic source of leaks). Correct, portable JDBC code is verbose and error-prone — the business logic drowns in boilerplate.
+
+			JPA is built on JDBC. Hibernate uses JDBC underneath. When you call entityManager.persist(user), Hibernate eventually calls preparedStatement.executeUpdate(...) on a JDBC PreparedStatement. JPA is a higher-level abstraction, not a replacement.
+
+		JDBC: The standard Java SE API for executing SQL against relational databases. It consists of vendor-neutral interfaces (Connection, Statement, ResultSet) in java.sql, implemented by vendor-specific drivers that speak each database's native wire protocol. JDBC is low-level: it exposes SQL as strings and requires manual mapping between result sets and Java objects
+
+	Connection Pools and Datasources
+	--------------------------------
+
+		A connection pool is a cache of pre-opened database connections. The application borrows a connection from the pool, uses it, and returns it. The pool keeps the connection open and hands it to the next borrower.
+
+		The gains are enormous:
+
+			No per-request connection setup cost. Borrow is ~microseconds.
+			
+			The database sees a bounded number of connections (say, 20) regardless of how many requests the app is handling.
+			
+			The pool can enforce timeouts, validate connections, retry on failure, and log slow queries centrally.
+
+		A DataSource (javax.sql.DataSource → jakarta.sql.DataSource in modern naming) is the standard Java interface for obtaining connections. Instead of calling DriverManager.getConnection(...) with URLs and passwords in your code, you obtain a DataSource from the container and call dataSource.getConnection(). The DataSource is backed by the pool.
+
+		The important architectural point: the pool and the datasource are configured in the container, not in your code. This is one of the big values of using an application server:
+
+			
+			Your code says "give me a connection to the user database."
+			
+			The container knows what that means — URL, credentials, pool size, timeout settings — because it's all declared in standalone.xml.
+			
+			You can change the database URL, swap PostgreSQL for a replica, or tune pool size without touching, rebuilding, or redeploying the application.
+
+		DataSource: A factory interface in the JDBC API for obtaining database connections. In a Jakarta EE environment, DataSources are configured in the application server and looked up by name (via JNDI), decoupling connection details and pool configuration from application code.
+
+		connection pool: A managed cache of pre-opened database connections maintained by the application server or a dedicated library. Applications borrow connections from the pool for the duration of a unit of work and return them, amortizing connection setup cost across many requests and bounding the number of concurrent connections against the database.
+
+		In WildFly, the pool implementation is IronJacamar (another spec: Jakarta Connectors, formerly JCA). You don't interact with it directly; you declare a datasource in standalone.xml and it just works.
+
+	JNDI(Java Naming and Directory Interface)
+	-----------------------------------------
+
+		JNDI is a hierarchical name-to-object directory maintained by the container. WildFly binds the datasource into JNDI under a name you choose (e.g., java:/UserDS). Your application, if it wanted to, could look it up:
+
+
+			InitialContext ctx = new InitialContext();
+			DataSource ds = (DataSource) ctx.lookup("java:/UserDS");
+
+		You will almost never write this code — JPA (and @Resource injection, if you ever use it) handles JNDI lookups for you. But you'll see JNDI names in configuration files (standalone.xml, persistence.xml), and you need to recognize them. The java:/ prefix means "local to this JVM." Think of JNDI as a container-wide directory where every managed resource — datasources, EJBs, transaction managers — is registered under a name.
+
+		JNDI: A Java API for a hierarchical naming and directory service. In a Jakarta EE container, managed resources (datasources, EJBs, mail sessions, transaction managers) are bound to JNDI names by the container, and applications look them up by name. Modern Jakarta EE largely replaces explicit JNDI lookups with annotations like @Resource and @PersistenceContext, which perform the lookup under the hood.
+
+	Install the PostgreSQL Driver Into WildFly
+	------------------------------------------
+
+
+		The PostgreSQL JDBC driver is a JAR. We need it available at runtime to WildFly's datasource subsystem (so the datasource can open connections). We do not bundle it in our WAR — because the datasource is a server-level resource, declared in standalone.xml, used before any application even deploys. The driver must live inside WildFly, as part of the server.
+
+		WildFly solves this with its module system. Every library inside WildFly lives in modules/system/layers/base/<package-path>/main/ with a module.xml descriptor that declares the JAR's dependencies and exports. You can add your own modules.
+
+		The CLI didn't just change in-memory state — it persisted every command to standalone/configuration/standalone.xml. Open it and search for UserDS. You'll see something like:
+
+		xml
+		<datasource jndi-name="java:/UserDS" pool-name="UserDS" enabled="true" ...>
+		    <connection-url>jdbc:postgresql://localhost:5432/userdb</connection-url>
+		    <driver>postgresql</driver>
+		    <security>
+		        <user-name>postgres</user-name>
+		        <password>postgres</password>
+		    </security>
+		</datasource>
+		...
+		<drivers>
+		    <driver name="postgresql" module="org.postgresql">
+		        <driver-class>org.postgresql.Driver</driver-class>
+		    </driver>
+		</drivers>
+
+		This is important. You've just configured a server-level resource that outlives your application. Every WAR deployed to this WildFly can use java:/UserDS by name without any further setup. The resource is declared once, in the server, by an operator; applications consume it. This is the Jakarta EE separation of configuration (server/operator) from code (developer).
+
+	Jakarta Persistence (JPA)
+	-------------------------
+
+		The Spec Card
+		-------------
+
+			Specification: Jakarta Persistence 3.1 (still often called JPA)
+			
+			Purpose: Define a standard, portable way to map Java objects to relational database tables, and provide an API for creating, reading, updating, and deleting them.
+			
+			API package: jakarta.persistence.*
+			
+			Implementation in WildFly: Hibernate ORM
+			
+			What you write: Java classes annotated with @Entity (and column-mapping annotations), a persistence.xml descriptor, and code using EntityManager to perform operations.
+			
+			What WildFly does at runtime: at deployment, Hibernate reads persistence.xml, discovers entity classes, validates mappings, optionally creates/updates database schema, and creates an EntityManagerFactory. At request time, Hibernate issues an EntityManager scoped to the current transaction, translates your JPA calls into SQL, executes them via JDBC through the datasource, and maps result sets back to Java objects.
+			
+			Interacts with: JDBC/datasource (for SQL execution), Jakarta Transactions (for commit/rollback), CDI (entities can reference CDI beans in listeners), Jakarta Validation (constraints on entity fields enforced automatically).
+
+		Why JPA Exists
+		--------------
+
+			JDBC gives you SQL execution. That’s not nothing — but it leaves a huge gap:
+
+			1.Writing SQL by hand for every CRUD operation.
+			
+			2.Mapping ResultSet columns to Java fields manually, one rs.getString(1) at a time.
+			
+			3.Managing relationships (foreign keys → object references) by hand.
+			
+			4.Writing update statements that touch only the fields that changed.
+			
+			5.Managing identity (the same database row loaded twice should produce the same Java object).
+			
+			6.Avoiding the N+1 query problem when loading related objects.
+
+			JPA addresses all of these with a conceptual model: your objects are managed by a persistence context, which tracks their state and synchronizes it with the database at well-defined moments.
+
+		The Persistence Context — The Core JPA Concept
+		----------------------------------------------
+
+			This is the single most important concept in JPA. If you understand nothing else from this stage, understand this.
+
+			The persistence context is an in-memory cache of managed entities. For every entity it tracks, it knows:
+
+			1.The database identity (primary key).
+			
+			2.The current state of the Java object.
+			
+			3.The state the object had when it was loaded (the “snapshot”).
+			
+			4.Whether the entity is new, modified, deleted, or unchanged.
+
+			As long as an entity is “in” the persistence context, it’s managed — changes to its fields are automatically tracked. When the enclosing transaction commits, JPA compares current state against the snapshot and generates UPDATE statements for any entity that changed. This is called dirty checking, and you never see it happen explicitly. You just mutate your Java object; the UPDATE appears at commit time.
+
+			The persistence context also enforces entity identity: within one persistence context, loading the same database row twice returns the same Java object reference. entityA == entityB is true if they represent the same database row. This is what makes JPA’s relationship navigation (user.getOrders()) safe and consistent.
+
+			An entity has four lifecycle states:
+
+			New (transient) — a Java object you created with new User(). Not tracked by JPA. Not in the database.
+			Managed — tracked by the persistence context. Changes are dirty-checked. Will be synchronized to the database at commit.
+			Detached — was managed, but the persistence context closed (end of transaction). Still a valid object, but changes are no longer tracked.
+			Removed — scheduled for deletion. Will produce a DELETE at commit time.
+
+			Operations like persist, merge, remove, and find transition entities between these states.
+
+			Interview definition — persistence context: An in-memory set of managed entity instances, maintained by a JPA EntityManager, in which each database row is represented by at most one Java object. The persistence context tracks changes to managed entities and synchronizes them with the database at defined moments (typically transaction commit) via dirty checking. It also enforces entity identity: multiple lookups of the same database row return the same Java object reference.
+
+			Interview definition — entity lifecycle states: The four states a JPA entity can be in with respect to the persistence context: new/transient (not tracked, not in database), managed (tracked and synchronized), detached (previously managed, no longer tracked), and removed (scheduled for deletion). Transitions occur via EntityManager operations and transaction boundaries.
+
+	The User Entity
+	---------------
+
+		Create src/main/java/com/korah/learning/User.java:
+
+		java
+		package com.korah.learning;
+
+		import jakarta.persistence.Column;
+		import jakarta.persistence.Entity;
+		import jakarta.persistence.GeneratedValue;
+		import jakarta.persistence.GenerationType;
+		import jakarta.persistence.Id;
+		import jakarta.persistence.Table;
+
+		@Entity
+		@Table(name = "users")
+		public class User {
+
+		    @Id
+		    @GeneratedValue(strategy = GenerationType.IDENTITY)
+		    private Long id;
+
+		    @Column(name = "email", nullable = false, unique = true, length = 255)
+		    private String email;
+
+		    @Column(name = "password_hash", nullable = false, length = 255)
+		    private String passwordHash;
+
+		    public User() {
+		        // Required by JPA
+		    }
+
+		    public User(String email, String passwordHash) {
+		        this.email = email;
+		        this.passwordHash = passwordHash;
+		    }
+
+		    public Long getId() { return id; }
+		    public String getEmail() { return email; }
+		    public void setEmail(String email) { this.email = email; }
+		    public String getPasswordHash() { return passwordHash; }
+		    public void setPasswordHash(String passwordHash) { this.passwordHash = passwordHash; }
+		}
+
+		Every annotation and design choice, in order:
+		---------------------------------------------
+
+			@Entity — declares this class as a JPA entity. Hibernate’s annotation scanner at deployment finds every class with this annotation, validates its mapping, and registers it with the EntityManagerFactory. Without @Entity, the class is just a plain Java class — JPA ignores it entirely.
+
+			@Table(name = "users") — specifies the database table name. Without @Table, JPA defaults to the class name (User → table User). The explicit name is a good practice because:
+
+			user is a reserved word in PostgreSQL (and many SQL dialects).
+			Database conventions typically use lowercase plural: users, orders, products.
+			Being explicit makes refactoring the Java class name safe — the table name doesn’t change under you.
+
+			@Id — marks a field as the primary key. Every JPA entity must have an @Id field (or a composite @EmbeddedId). The persistence context uses this value as the entity’s identity key.
+
+			@GeneratedValue(strategy = GenerationType.IDENTITY) — the primary key is generated by the database, not by your code. IDENTITY means “use the database’s auto-increment column.” PostgreSQL implements this with SERIAL or BIGSERIAL. Hibernate will emit BIGSERIAL because our field is Long.
+
+		There are four generation strategies worth knowing:
+		-------------------------------------------
+
+			IDENTITY — database auto-increment. One INSERT per entity (can’t batch; the database must assign the ID before Hibernate knows it).
+			
+			SEQUENCE — database sequence (PostgreSQL’s native approach). Allows batching; Hibernate can pre-fetch IDs. Generally the best choice on PostgreSQL, but requires an explicit sequence setup. We’re using IDENTITY for simplicity in Stage 5.
+			
+			TABLE — a dedicated table stores next-ID values. Portable but slow. Rarely used.
+			
+			AUTO — Hibernate picks for you based on the database dialect. On PostgreSQL, modern Hibernate picks SEQUENCE.
+
+		@Column(name = "email", nullable = false, unique = true, length = 255) — maps a Java field to a database column with constraints:
+
+			name — the column name. Without it, the column name defaults to the field name.
+			nullable = false — Hibernate will create the column as NOT NULL and reject nulls on insert/update.
+			unique = true — Hibernate will create a UNIQUE constraint on this column. Duplicate inserts become ConstraintViolationException.
+			length = 255 — column width for VARCHAR. Default is 255; being explicit is good discipline.
+
+			@Column on passwordHash — same mapping machinery. The field is called passwordHash deliberately: we will never store plaintext passwords. Stage 8 will discuss hashing in depth.
+
+			Public no-arg constructor — JPA requires this. Hibernate uses it to instantiate entities when loading rows (via reflection, calling the no-arg constructor and then setting fields). You can also provide additional constructors, but the no-arg must exist. If you omit it, deployment fails with a clear error at startup. This is the single most common early-career JPA mistake.
+
+			Getters and setters — not strictly required for all fields, but conventional and required if you want JPA to use property access rather than field access. (The access mode is determined by where you put @Id — on a field → field access; on a getter → property access. Our entity uses field access.)
+
+			No business logic — the entity is a data class, not a behavior class. All business rules go in the service layer. The entity’s job is to represent a database row.
+
+			Interview definition — JPA entity: A plain Java class annotated with @Entity that represents a row in a database table. It must have an @Id field designating the primary key and a public no-arg constructor. Field-to-column mapping is derived from @Column annotations or defaults based on field names.
+
+	The persistence.xml File
+	------------------------
+
+		<?xml version="1.0" encoding="UTF-8"?>
+		<persistence xmlns="https://jakarta.ee/xml/ns/persistence"
+		             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		             xsi:schemaLocation="https://jakarta.ee/xml/ns/persistence
+		                                 https://jakarta.ee/xml/ns/persistence/persistence_3_0.xsd"
+		             version="3.0">
+
+		    <persistence-unit name="userPU" transaction-type="JTA">
+		        <jta-data-source>java:/UserDS</jta-data-source>
+
+		        <properties>
+		            <property name="jakarta.persistence.schema-generation.database.action" value="update"/>
+		            <property name="hibernate.show_sql" value="true"/>
+		            <property name="hibernate.format_sql" value="true"/>
+		        </properties>
+		    </persistence-unit>
+
+		</persistence>
+
+		The location matters: it must be at src/main/resources/META-INF/persistence.xml, which lands in WEB-INF/classes/META-INF/persistence.xml inside the WAR. Hibernate scans the classpath for this file at deployment.
+
+		Dissecting every element:
+		-------------------------
+
+			<persistence-unit name="userPU"> — a persistence unit is a logical grouping: one database, one set of entities, one JPA configuration. Our app has one. Larger apps may have several (e.g., a reporting database alongside the main one). The name is how your code references it — we’ll use "userPU" to inject the EntityManager.
+
+			transaction-type="JTA" — transactions are managed by the container’s Jakarta Transactions subsystem, not by application code. This is the correct choice in a Jakarta EE app. The alternative, RESOURCE_LOCAL, means “the application calls transaction.begin() and commit() itself” — used in Java SE apps using JPA standalone. Stage 6 will unpack JTA fully.
+
+			<jta-data-source>java:/UserDS</jta-data-source> — JPA uses the datasource at this JNDI name. This is where the configuration-vs-code separation pays off: persistence.xml doesn’t know the URL, credentials, or pool size — it only names a resource. The server owns those details.
+
+			No <class> elements — in a Jakarta EE environment, Hibernate auto-discovers @Entity classes in the WAR. In Java SE, you’d list them explicitly. One less thing to maintain.
+
+			The properties:
+			---------------
+
+				jakarta.persistence.schema-generation.database.action = update — on deployment, Hibernate inspects the database schema and adds any missing tables and columns to match your entities. “Update” is lenient: it won’t drop columns, won’t alter types. This is a development convenience, not a production practice. In production you’d use migration tools (Flyway, Liquibase) and this property would be none. Stage 13 covers migrations properly.
+				
+				hibernate.show_sql = true and hibernate.format_sql = true — Hibernate logs every SQL statement it issues, formatted. This is the single most valuable Hibernate setting for learning. We’ll use it to see exactly what JPA is doing. Turn off in production.
+
+			persistence unit: A JPA configuration unit defined in persistence.xml that groups a set of entity classes, a datasource, a transaction type, and provider-specific properties. An application can have multiple persistence units (e.g., one per database). Code references a persistence unit by name when obtaining an EntityManager.
+	
+	The UserRepository
+	------------------
+
+		Every element matters:
+		----------------------
+
+			@ApplicationScoped — the repository is a stateless service, same as HelloService. One instance for the app.
+
+			@PersistenceContext(unitName = "userPU") private EntityManager entityManager; — this is JPA’s injection mechanism, distinct from CDI’s @Inject. Here’s why:
+
+			The EntityManager is special. It’s bound to a transaction, not to a long-lived scope. A single UserRepository (application-scoped, singleton) will serve many different transactions over its lifetime, and each one needs the correct EntityManager for that transaction.
+
+			@PersistenceContext doesn’t inject a real EntityManager. It injects a container-managed proxy. Every method call on this proxy — persist, find, createQuery — is dispatched to the EntityManager associated with the currently active transaction on the current thread. Different request, different thread, different transaction, different real EntityManager — but your repository code holds a stable reference to the same proxy.
+
+			Who processes @PersistenceContext? WildFly’s JPA subsystem, at bean instantiation time. It sees the annotation, finds the persistence unit named "userPU", and injects a proxy backed by the EntityManagerFactory for that unit.
+
+			What’s the difference between @PersistenceContext and @Inject? @Inject is CDI; it resolves beans. @PersistenceContext is JPA; it resolves EntityManager references in a way that’s transaction-aware. Modern CDI integration can make @Inject EntityManager work, but @PersistenceContext is the historically correct and widely-used form.
+
+			Interview definition — @PersistenceContext: A Jakarta Persistence annotation that injects a container-managed EntityManager proxy into a managed bean. The proxy transparently resolves to the EntityManager associated with the current JTA transaction on each invocation, allowing a long-lived singleton to interact correctly with per-request transactions.
+
+			entityManager.persist(user) — the operation that schedules a new entity for insertion. We’ll trace exactly what this does in the next section. Note: it doesn’t necessarily execute an INSERT right now; it enters the entity into the persistence context as “new, pending insert.”
+
+			entityManager.find(User.class, id) — JPA’s primary-key lookup. Returns null if not found (which we wrap in Optional to force the caller to think about the empty case).
+
+			entityManager.createQuery(...) — creates a JPQL (Jakarta Persistence Query Language) query. JPQL is SQL-like, but operates on entities and their fields, not on tables and columns:
+
+			java
+			"SELECT u FROM User u WHERE u.email = :email"
+			User is the entity name (not the table name — JPQL is object-oriented).
+			u.email is the field name on the entity — not the column name.
+			:email is a named parameter, bound via setParameter.
+
+			Hibernate translates this JPQL into dialect-specific SQL at runtime. The JPQL above becomes approximately:
+
+			sql
+			SELECT u.id, u.email, u.password_hash FROM users u WHERE u.email = ?
+
+			JPQL is portable across databases; the generated SQL is not. Never, ever use string concatenation to build JPQL queries from user input. createQuery("... WHERE u.email = '" + email + "'") is SQL injection even through JPQL. Always use parameters.
+
+			Interview definition — JPQL: The query language defined by Jakarta Persistence. Syntactically similar to SQL but operates on entity classes and their fields rather than tables and columns. The JPA provider translates JPQL to dialect-specific SQL at runtime, allowing queries to be portable across databases.
+
+			getResultStream().findFirst() — modern Java-idiomatic way of saying “at most one result.” If zero rows match, returns Optional.empty(). The older idiom was getSingleResult(), which throws NoResultException on zero matches — awkward exception-driven flow for a common case.
+
+
+	The Chain from persist() to SQL
+	-------------------------------
+
+	Earlier I promised to trace what actually happens when you call entityManager.persist(user). We can’t fully demonstrate this until Stage 6 (transactions), but conceptually, here’s the chain. Memorize this picture — it’s one of the most-asked interview questions.
+
+		Application:
+		    user = new User("korah@example.com", "hashed_password")
+		    userRepository.save(user)              ← your code
+		         │
+		         ▼
+		    entityManager.persist(user)            ← JPA call via @PersistenceContext proxy
+		         │
+		         ▼  (proxy resolves to transaction-scoped EntityManager)
+		         │
+		Hibernate (JPA Provider):
+		    1. Checks entity state: it's new (transient)
+		    2. Generates/reserves primary key (for IDENTITY: deferred to INSERT)
+		    3. Adds entity to persistence context as "managed, pending insert"
+		    4. Does NOT execute SQL yet — writes are batched until flush
+		         │
+		         ▼
+		    (time passes, more operations may occur)
+		         │
+		         ▼
+		    Flush (triggered by: commit, explicit flush, or query that could see the pending write)
+		         │
+		         ▼
+		    5. Hibernate walks the persistence context, finds pending inserts
+		    6. Generates SQL: INSERT INTO users (email, password_hash) VALUES (?, ?)
+		    7. Obtains a JDBC Connection from the datasource (via WildFly)
+		    8. Prepares a PreparedStatement
+		    9. Binds parameters (email, password_hash) to statement positions 1, 2
+		   10. Executes statement
+		         │
+		         ▼
+		JDBC Driver (PostgreSQL):
+		   11. Serializes the statement + parameters into PostgreSQL wire protocol bytes
+		   12. Writes bytes to the socket
+		         │
+		         ▼
+		PostgreSQL:
+		   13. Receives bytes, parses the statement
+		   14. Executes within the current transaction
+		   15. Returns the generated id (because of IDENTITY)
+		         │
+		         ▼
+		JDBC Driver:
+		   16. Reads response bytes, parses them
+		   17. Returns the generated key via ResultSet
+		         │
+		         ▼
+		Hibernate:
+		   18. Sets the generated id on the User object
+		   19. Entity is now fully managed, with id populated
+		         │
+		         ▼
+		Transaction commit (end of request):
+		   20. Hibernate flushes any remaining pending writes
+		   21. JTA commit → PostgreSQL COMMIT
+		   22. Persistence context closes
+		   23. All entities become detached
+
+	Twenty-three steps for one persist() call. The vast majority is work the JPA provider and the container are doing for you. You wrote step 1 — the one line that said what you wanted. Everything else is the stack.
+
+	The two subtleties worth highlighting:
+
+	JPA writes are deferred. persist() does not immediately execute INSERT. It schedules the entity. Hibernate flushes at well-defined moments (commit, explicit flush, or when a query would see stale data). This enables batching and ordering optimizations — one of JPA’s biggest performance wins.
+
+	Dirty checking happens at flush, not at mutation. When you set user.setEmail("new@email.com") on a managed entity, no SQL is sent. At flush time, Hibernate compares the current object state to the snapshot it took when loading, and generates UPDATE for whatever changed. If nothing changed, no SQL. If three fields changed, one UPDATE for all three (unless configured otherwise). You never write UPDATE SQL yourself for managed entities.
+
+------------------------------------------------------------------------------------------------------------------
+
+Jakarta Transactions
+--------------------
+	
+	What a Transaction Actually Is
+	------------------------------
+
+		Before any annotation, strip this concept to its essence. A transaction is a sequence of database operations treated as a single, indivisible unit of work. Either every operation in the unit succeeds and becomes permanent, or none of them do — the database rolls back to the state it was in before the unit started.
+
+		That’s the entire concept. Everything else — isolation levels, propagation, two-phase commit — is engineering around that single guarantee.
+
+		Why does this matter? Consider registering a user that also sends them a welcome email and creates an audit log entry. Three operations:
+
+		INSERT INTO users ...
+		INSERT INTO audit_log ...
+		INSERT INTO outbox_emails ...
+
+		What if operation #2 fails after #1 succeeded? Without transactions: you have a user with no audit entry. The database is in a state your business rules forbid. Worse, the failure is silent — nothing in your code or data flags that something’s wrong. With transactions: #1 and #2 both roll back. The user doesn’t exist. The world retries.
+
+		Transactions are the mechanism that lets you reason about database state as consistent snapshots rather than a chaotic sequence of individual writes. Lose that mechanism, and the mental model you use to design business logic collapses.
+
+
+		database transaction: A sequence of database operations executed as a single atomic unit. Either all operations commit and become permanently visible, or all are rolled back and no change is applied. Transactions are the primary mechanism for maintaining data consistency in the presence of concurrent access and partial failures.
+
+		ACID — The Properties Transactions Guarantee
+		--------------------------------------------
+
+			Four letters, four guarantees.
+
+			A — Atomicity. All operations in the transaction succeed, or none do. There is no intermediate state visible after the transaction ends. The “all-or-nothing” guarantee.
+
+			C — Consistency. The transaction moves the database from one valid state to another valid state, as defined by the database’s constraints (primary keys, unique constraints, foreign keys, check constraints). If a transaction would violate a constraint, the whole transaction is rejected.
+
+			I — Isolation. Concurrent transactions don’t see each other’s uncommitted changes. The database behaves as if transactions ran serially one after another (though in reality it allows parallelism via locking or multi-version concurrency control). There are isolation levels (READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, SERIALIZABLE) that trade stricter isolation for lower concurrency. PostgreSQL defaults to READ COMMITTED.
+
+			D — Durability. Once a transaction commits, its changes survive crashes, power failures, and reboots. The database writes commit records to disk (usually to a write-ahead log) before acknowledging the commit. The guarantee: if the database says “committed,” the data is on physical storage.
+
+			ACID: The four properties that define transactional guarantees: Atomicity (all-or-nothing execution), Consistency (transactions preserve database invariants), Isolation (concurrent transactions don’t interfere), Durability (committed changes survive failures). Together, ACID lets applications reason about the database as a sequence of valid, consistent states.
+
+		Why This Is a Separate Spec from Persistence
+		--------------------------------------------
+
+			JPA knows how to translate Java calls into SQL. JTA (Jakarta Transactions) knows how to open, commit, and roll back transactions — potentially across multiple resources (two databases, a database and a message queue, etc.) in a coordinated way. They are deliberately separated because transactions are not a persistence concern — they are a coordination concern that spans resources.
+
+			In a Java SE app using JDBC directly, you’d write:
+
+			Connection conn = dataSource.getConnection();
+			try {
+			    conn.setAutoCommit(false);
+			    // ... do stuff
+			    conn.commit();
+			} catch (SQLException e) {
+			    conn.rollback();
+			    throw e;
+			} finally {
+			    conn.close();
+			}
+
+			Six lines of ceremony around one line of business logic. Error-prone, repetitive, and easy to forget the rollback() or the close(). Every bug in that pattern — a missed exception, a swallowed close(), a nested transaction that got committed too early — becomes a data corruption bug.
+
+			Jakarta EE’s answer: you don’t write any of that. You annotate a method with @Transactional, and the container runs the ceremony around it.
+
+		The Spec Card
+		--------------
+
+			Specification: Jakarta Transactions (JTA) 2.0
+			
+			Purpose: Define a standard API and container-managed model for transaction demarcation, so applications can declare transactional boundaries without writing begin/commit/rollback code.
+			
+			API package: jakarta.transaction.*
+			
+			Implementation in WildFly: Narayana (also called the JBoss Transaction Service)
+			
+			What you write: @Transactional on service methods (and optionally transaction-attribute values).
+			
+			What WildFly does at runtime: intercepts calls to @Transactional methods, begins a transaction before the method runs (or joins an existing one, depending on propagation), commits on normal return, rolls back on exception. Coordinates with JPA so the EntityManager flushes and participates correctly.
+			
+			Interacts with: JPA (persistence context lifecycle is bound to the transaction), CDI (interceptor applies to CDI beans), Security (transaction identity propagation).
+
+		How @Transactional Actually Works
+		---------------------------------
+
+			@Transactional is a CDI interceptor. Here’s what that means mechanically:
+
+			When Weld (CDI) processes a bean that has @Transactional methods, it doesn’t just hand you a plain instance. It generates a proxy that wraps your bean. Every call to a @Transactional method goes through the proxy first. The proxy does this:
+
+			Before your method runs:
+			    1. Check if a transaction is already in progress on this thread
+			    2. If not, ask Narayana to start a new one
+			    3. Register the transaction with the current thread
+
+			Invoke your actual method
+
+			After your method returns:
+			    4. If it returned normally: ask Narayana to commit
+			    5. If it threw a RuntimeException: ask Narayana to rollback
+			    6. If it threw a checked Exception: by default, STILL commit
+			       (configurable via rollbackOn / dontRollbackOn)
+			    7. Unregister the transaction from the thread
+
+			Point #6 is a surprising default and worth internalizing. By default, Jakarta Transactions only rolls back on unchecked exceptions (RuntimeException and its subclasses). Checked exceptions commit the transaction unless you explicitly tell it otherwise. This matches the convention that checked exceptions represent expected conditions (business errors you handle), while unchecked exceptions represent bugs or infrastructure failures that should abort the operation.
+
+			If you want a specific exception to roll back regardless, declare it:
+
+			@Transactional(rollbackOn = {UserAlreadyExistsException.class})
+
+			@Transactional: A Jakarta Transactions annotation that marks a method as transactional. A CDI interceptor begins a transaction before the method executes (or joins an existing one, per the configured propagation) and commits on successful return or rolls back on an unchecked exception. By default, checked exceptions do not trigger rollback unless listed in rollbackOn.
+
+		Transaction Propagation
+		-----------------------
+
+			What happens when a @Transactional method calls another @Transactional method? Answer: depends on the propagation setting of the inner method.
+
+			The common values:
+			------------------
+
+				REQUIRED (default) — if a transaction is already active, join it. Otherwise, start a new one. 99% of use cases.
+				
+				REQUIRES_NEW — always start a new transaction, suspending any existing one. The outer transaction resumes when the inner completes. Used for things like audit logging that must commit even if the main transaction fails.
+				
+				MANDATORY — must be called within an existing transaction; throws if none exists. Used to enforce that callers wrap this logic in a transaction.
+				
+				NEVER — must not be called within a transaction; throws if one exists.
+				
+				NOT_SUPPORTED — suspends any existing transaction, runs without one, resumes afterward.
+				
+				SUPPORTS — joins a transaction if one exists, runs without one if not. Rarely useful.
+
+			For our app, REQUIRED is correct everywhere. We’ll touch other values when we have a real reason to.
+
+			transaction propagation: A per-method configuration that determines how a transactional method interacts with any transaction already in progress on the calling thread. REQUIRED (join or create), REQUIRES_NEW (suspend outer, start new), MANDATORY (require existing), NEVER (require no existing), NOT_SUPPORTED (suspend outer, run without), and SUPPORTS (join if present) are the standard values.
+
+		Why Interceptors Can’t Catch Self-Calls
+		---------------------------------------
+
+			Important gotcha, worth planting early. The interceptor only runs when the method is called through the proxy — i.e., from outside the bean. If a method on the same bean calls another method on the same bean directly (via this.someMethod()), the proxy is bypassed, and @Transactional has no effect.
+
+			java
+			@ApplicationScoped
+			public class UserService {
+
+			    @Transactional
+			    public void registerUser(...) {
+			        validateUser(...);        // internal call — proxy NOT invoked
+			    }
+
+			    @Transactional(rollbackOn = ValidationException.class)
+			    public void validateUser(...) {
+			        // The @Transactional here is IGNORED when called from registerUser
+			    }
+			}
+
+			The fix is either to split the methods into two beans (so one injects the other) or to be aware that @Transactional applies at the entry point from outside, not at nested internal calls. This bites every Jakarta EE and Spring developer at least once.
+
+		Service with Transaction
+		------------------------
+
+			package com.korah.learning;
+
+			import jakarta.enterprise.context.ApplicationScoped;
+			import jakarta.inject.Inject;
+			import jakarta.transaction.Transactional;
+
+			@ApplicationScoped
+			public class UserService {
+
+			    @Inject
+			    UserRepository userRepository;
+
+			    @Transactional
+			    public User registerUser(String email, String passwordHash) {
+			        User user = new User(email, passwordHash);
+			        userRepository.save(user);
+			        return user;
+			    }
+			}
+
+			Dissect:
+			--------
+
+				@ApplicationScoped — one instance, stateless service. CDI manages it.
+
+				@Inject UserRepository userRepository — standard CDI injection.
+
+				@Transactional on registerUser — the whole method executes in a transaction. Before the method runs, Narayana opens a transaction. The userRepository.save(user) call (which internally calls entityManager.persist(user)) now has an active transaction to attach to. When the method returns, the transaction commits, and the pending INSERT is flushed to PostgreSQL.
+
+				Note what’s returned. After entityManager.persist(user) and the commit, user.getId() is populated (because we used IDENTITY generation, the DB-assigned ID is set on the Java object at insert time). The caller gets back a User with an ID.
+
+			package com.korah.learning;
+
+			import jakarta.inject.Inject;
+			import jakarta.ws.rs.Consumes;
+			import jakarta.ws.rs.POST;
+			import jakarta.ws.rs.Path;
+			import jakarta.ws.rs.Produces;
+			import jakarta.ws.rs.core.MediaType;
+			import jakarta.ws.rs.core.Response;
+
+			@Path("/users")
+			public class UserResource {
+
+			    @Inject
+			    UserService userService;
+
+			    @POST
+			    @Consumes(MediaType.APPLICATION_JSON)
+			    @Produces(MediaType.APPLICATION_JSON)
+			    public Response register(RegisterRequest request) {
+			        User created = userService.registerUser(request.email, request.passwordHash);
+			        return Response.status(Response.Status.CREATED)
+			                       .entity(new UserResponse(created.getId(), created.getEmail()))
+			                       .build();
+			    }
+
+			    public static class RegisterRequest {
+			        public String email;
+			        public String passwordHash;  // We'll hash this properly in Stage 8
+			    }
+
+			    public static class UserResponse {
+			        public Long id;
+			        public String email;
+
+			        public UserResponse() {}
+			        public UserResponse(Long id, String email) {
+			            this.id = id;
+			            this.email = email;
+			        }
+			    }
+			}
+
+			@POST — handles POST requests. For creating resources, POST is the standard verb.
+
+			@Consumes(MediaType.APPLICATION_JSON) — this method accepts request bodies in JSON format. RESTEasy will use JSON-B to deserialize the incoming JSON into the RegisterRequest parameter.
+
+			@Produces(MediaType.APPLICATION_JSON) — response body will be JSON.
+
+			RegisterRequest parameter — not annotated with anything. In JAX-RS, an unannotated parameter is treated as the request body. RESTEasy walks its registry of Message Body Readers, finds JSON-B for application/json, deserializes the body into this type.
+
+			Response.status(...).entity(...).build() — explicit response construction. We use Response instead of returning the DTO directly because we want to set a specific status code (201 CREATED, which is the HTTP convention for “resource successfully created”). Returning a plain object would default to 200 OK.
+
+			Inner DTO classes — RegisterRequest and UserResponse are DTOs (Data Transfer Objects). They’re separate from the User entity for important reasons we’ll discuss in Stage 7 (preview: never expose entities over the API). For now, keeping them as inner classes is pragmatic; we’ll extract them in Stage 7.
+
+			Why we don’t return the entity directly: The User entity has a passwordHash field. Returning it as JSON would leak hashed passwords to clients. Even without the password hash, exposing entities couples your API shape to your database shape — any schema change becomes an API-breaking change. DTOs decouple the two.
+
+		The Full Trace, Now With Transactions
+		-------------------------------------
+
+			Browser → Undertow (HTTP parse, thread dispatch)
+			    ↓
+			RESTEasy dispatcher servlet (matches /api/users → UserResource.register)
+			    ↓
+			JSON-B deserializes body → RegisterRequest
+			    ↓
+			RESTEasy asks CDI for UserResource (new instance per request)
+			    ↓
+			CDI resolves @Inject UserService → provides proxy
+			    ↓
+			UserResource.register(request) invoked
+			    ↓
+			Calls userService.registerUser(email, passwordHash)
+			    ↓
+			    [UserService proxy intercepts — Transactional interceptor]
+			    ↓
+			    Narayana: begin transaction (binds to current thread)
+			    ↓
+			    JPA subsystem: open EntityManager, associate with transaction
+			    ↓
+			    [actual UserService.registerUser executes]
+			    ↓
+			    new User(...)
+			    ↓
+			    userRepository.save(user)  → entityManager.persist(user)
+			    ↓
+			    Hibernate: entity marked "managed, pending insert" in persistence context
+			       (NO SQL YET — write is deferred until flush)
+			    ↓
+			    [UserService.registerUser returns]
+			    ↓
+			    [Transactional interceptor: method returned normally → commit]
+			    ↓
+			    Narayana: commit transaction
+			    ↓
+			    JPA: flush persistence context → Hibernate generates INSERT SQL
+			    ↓
+			    Hibernate: get JDBC Connection from UserDS pool
+			    ↓
+			    PreparedStatement.executeUpdate() → PostgreSQL wire protocol
+			    ↓
+			    PostgreSQL: INSERT, assign ID, return
+			    ↓
+			    Hibernate: set id on User object, mark entity as persisted
+			    ↓
+			    Narayana: commit JDBC transaction (actual COMMIT sent to Postgres)
+			    ↓
+			    JPA: close EntityManager
+			    ↓
+			    Return User to UserResource.register
+			    ↓
+			UserResource.register wraps User in UserResponse DTO
+			    ↓
+			Response.status(201).entity(response).build()
+			    ↓
+			RESTEasy: find Message Body Writer for UserResponse + application/json
+			    ↓
+			JSON-B serializes to {"id":1,"email":"..."}
+			    ↓
+			Undertow writes HTTP response to socket
+			    ↓
+			Browser receives 201 Created with JSON body
