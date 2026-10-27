@@ -507,3 +507,22 @@ The Four Layers
 		You can replace the default implementation on WildFly (e.g., swap in EclipseLink instead of Hibernate for JPA) but doing so is rare, WildFly-specific, and outside the scope of what we're learning. Just know it's possible.
 
 		Interview definition — subsystem (WildFly): A modular component of the WildFly application server that provides a specific capability, such as HTTP handling, JPA, CDI, or security. Each subsystem wraps an implementation of one or more Jakarta EE specifications and is configured in standalone.xml. Subsystems can be disabled to trim server startup and memory footprint. 
+
+
++----------------+---------------------+-----------------------------------------------+----------------------------------------------+---------------------+
+| Annotation     | Spring project      | Purpose                                       | Who processes it                             | When                |
++----------------+---------------------+-----------------------------------------------+----------------------------------------------+---------------------+
+| @Component     | spring-context      | Generic bean stereotype                       | ClassPathBeanDefinitionScanner               | Startup (scan)      |
+| @Service       | spring-context      | @Component — semantic marker for service      | Same as @Component                           | Same                |
+|                |                     | layer                                          |                                              |                     |
+| @Repository    | spring-context      | @Component + exception translation trigger   | Component scan +                             | Startup + runtime   |
+|                |                     |                                               | PersistenceExceptionTranslationPostProcessor |                     |
+| @Autowired     | spring-beans        | Marks constructor/setter/field for DI         | AutowiredAnnotationBeanPostProcessor         | Bean instantiation  |
+| @Qualifier     | spring-beans        | Disambiguate among multiple candidates       | Same                                         | Bean instantiation  |
+| @Primary       | spring-context      | Preferred bean when multiple candidates      | DefaultListableBeanFactory.                  | Bean instantiation  |
+|                |                     | exist                                         | determineAutowireCandidate                   |                     |
+| @Scope         | spring-context      | Non-default scope for a bean                 | ClassPathBeanDefinitionScanner reads it      | Startup + runtime   |
+|                |                     |                                               | into the definition                          |                     |
+| @PostConstruct  | jakarta.annotation  | Init callback after DI complete              | CommonAnnotationBeanPostProcessor             | Bean initialization |
+| @PreDestroy    | jakarta.annotation  | Cleanup callback before shutdown              | Same                                         | Context shutdown    |
++----------------+---------------------+-----------------------------------------------+----------------------------------------------+---------------------+
